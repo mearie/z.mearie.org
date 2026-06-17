@@ -1,0 +1,2283 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>PP-OCRv6 WebGL</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0f0f1a;color:#ccc;padding:20px}
+h2{color:#7eb8ff;margin-bottom:8px}
+#status{margin:8px 0;color:#aaa}
+#fileInput{margin:8px 0;padding:6px}
+.canvas-wrap{position:relative;display:inline-block;margin:10px 0}
+canvas{max-width:min(600px,100%);border:1px solid #333;display:block}
+#results{margin:10px 0;max-height:300px;overflow-y:auto}
+.region{padding:4px 10px;margin:2px 0;background:#1a1a2e;border-left:3px solid #4a9;font-family:monospace;font-size:13px}
+#log{font-family:monospace;font-size:11px;color:#888;white-space:pre-wrap;max-height:150px;overflow-y:auto;margin-top:10px}
+</style>
+</head>
+<body>
+<h2>PP-OCRv6 WebGL OCR</h2>
+<div id="status">초기화 중...</div>
+<input type="file" id="fileInput" accept="image/*" disabled>
+<div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+<div id="results"></div>
+<pre id="log"></pre>
+<canvas id="glCanvas" width="1" height="1" style="display:none"></canvas>
+
+<script>
+'use strict';
+const USE_CONV1X1=true, USE_DW_CONV=true, USE_GPU_MATMUL=true;
+const DET_MAX_SIDE=960, DET_THRESH=0.2, DET_BOX_THRESH=0.45, DET_UNCLIP_RATIO=1.4;
+const REC_HEIGHT=48, REC_TARGET_WIDTH=320;
+const DET_MEAN=[.485,.456,.406], DET_STD=[.229,.224,.225];
+
+const statusEl=document.getElementById('status');
+const logEl=document.getElementById('log');
+function log(s){logEl.textContent+=s+'\n'; logEl.scrollTop=logEl.scrollHeight;}
+function setStatus(s){statusEl.textContent=s;}
+
+// ============ WebGL SETUP ============
+const glCanvas=document.getElementById('glCanvas');
+const gl=glCanvas.getContext('webgl2',{antialias:false,premultipliedAlpha:false});
+if(!gl){setStatus('WebGL2 not supported');throw new Error('no webgl2');}
+const extFloat=gl.getExtension('EXT_color_buffer_float');
+if(!extFloat){setStatus('EXT_color_buffer_float not supported');throw new Error('no float fbo');}
+gl.getExtension('OES_texture_float_linear');
+
+const fbo=gl.createFramebuffer();
+
+// Fullscreen quad VAO
+const quadVAO=gl.createVertexArray();
+gl.bindVertexArray(quadVAO);
+const quadBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+// ============ FLOAT16 CONVERSION ============
+const _cvtBuf=new ArrayBuffer(4),_cvtF32=new Float32Array(_cvtBuf),_cvtU32=new Uint32Array(_cvtBuf);
+function f32ToF16(f32){
+  const u16=new Uint16Array(f32.length);
+  for(let i=0;i<f32.length;i++){
+    _cvtF32[0]=f32[i];const b=_cvtU32[0];
+    const s=(b>>16)&0x8000,e=((b>>23)&0xff)-112,m=(b>>13)&0x3ff;
+    u16[i]=e<=0?s:e>=31?s|0x7c00:s|(e<<10)|m;
+  }
+  return u16;
+}
+function f16ToF32(u16){
+  const f32=new Float32Array(u16.length);
+  for(let i=0;i<u16.length;i++){
+    const h=u16[i],s=(h&0x8000)<<16,e=(h>>10)&0x1f,m=h&0x3ff;
+    _cvtU32[0]=e===0?s:e===31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);
+    f32[i]=_cvtF32[0];
+  }
+  return f32;
+}
+
+// ============ TEXTURE UTILS ============
+function makeTex(w,h,data){
+  const t=gl.createTexture();
+  gl.activeTexture(gl.TEXTURE15);
+  gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  if(data instanceof Uint16Array)
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,data);
+  else if(data)
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,f32ToF16(data));
+  else
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+  gl.bindTexture(gl.TEXTURE_2D,null);
+  return t;
+}
+function readTex(tex,w,h){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  const u16=new Uint16Array(w*h*4);
+  gl.readPixels(0,0,w,h,gl.RGBA,gl.HALF_FLOAT,u16);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  return f16ToF32(u16);
+}
+function freeTex(t){if(t){gl.deleteTexture(t);}}
+
+const texPool=new Map();
+function makeOutTex(w,h){
+  const key=w+','+h;
+  const bucket=texPool.get(key);
+  if(bucket&&bucket.length>0)return bucket.pop();
+  return makeTex(w,h,null);
+}
+function recycleTex(t,w,h){
+  if(!t)return;
+  const key=w+','+h;
+  let bucket=texPool.get(key);
+  if(!bucket){bucket=[];texPool.set(key,bucket);}
+  if(bucket.length<32)bucket.push(t); else gl.deleteTexture(t);
+}
+
+// Spatial tensor: shape [C,H,W] stored as texture [W, H*CG] RGBA
+// CG = ceil(C/4), texel (x, sy*CG+cg) = 4 channels at spatial (x,sy), channel group cg
+function spatialTexSize(C,H,W){return [W, H*Math.ceil(C/4)];}
+
+function cpuToSpatialTex(data,C,H,W){
+  const CG=Math.ceil(C/4);
+  const tW=W, tH=H*CG;
+  const buf=new Float32Array(tW*tH*4);
+  for(let c=0;c<C;c++){
+    const cg=c>>2, cs=c&3;
+    for(let y=0;y<H;y++){
+      for(let x=0;x<W;x++){
+        buf[((y*CG+cg)*tW+x)*4+cs] = data[c*H*W+y*W+x];
+      }
+    }
+  }
+  return makeTex(tW,tH,buf);
+}
+
+function spatialTexToCpu(tex,C,H,W){
+  const CG=Math.ceil(C/4);
+  const tW=W, tH=H*CG;
+  const raw=readTex(tex,tW,tH);
+  const out=new Float32Array(C*H*W);
+  for(let c=0;c<C;c++){
+    const cg=c>>2, cs=c&3;
+    for(let y=0;y<H;y++){
+      for(let x=0;x<W;x++){
+        out[c*H*W+y*W+x] = raw[((y*CG+cg)*tW+x)*4+cs];
+      }
+    }
+  }
+  return out;
+}
+
+// Weight texture: flat RGBA16F packing all model weights
+function makeWeightTex(f16Buf){
+  const u16=new Uint16Array(f16Buf);
+  const nTexels=Math.ceil(u16.length/4);
+  const texW=Math.min(nTexels,4096);
+  const texH=Math.ceil(nTexels/texW);
+  const padded=new Uint16Array(texW*texH*4);
+  padded.set(u16);
+  const tex=makeTex(texW,texH,padded);
+  return {tex,texW};
+}
+
+// Small [C] vector -> [1, CG] texture
+function vecToTex(data,C){
+  const CG=Math.ceil(C/4);
+  const buf=new Float32Array(CG*4);
+  buf.set(data.subarray(0,C));
+  return makeTex(1,CG,buf);
+}
+
+// ============ SHADERS ============
+const VS=`#version 300 es
+in vec2 a_pos;
+void main(){gl_Position=vec4(a_pos,0,1);}`;
+
+const FS_CONV=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_wt;
+uniform int u_iC,u_oC,u_iH,u_iW,u_kH,u_kW,u_sH,u_sW,u_pH,u_pW,u_grp,u_iCG,u_oCG,u_wB,u_wTW;
+out vec4 fc;
+float rw(int i){i+=u_wB;int t=i>>2,c=i&3;vec4 v=texelFetch(u_wt,ivec2(t%u_wTW,t/u_wTW),0);return c==0?v.r:c==1?v.g:c==2?v.b:v.a;}
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_oCG,ocg=fy-oy*u_oCG,oc0=ocg*4;
+  vec4 s=vec4(0);
+  if(u_grp==u_iC&&u_grp==u_oC){
+    for(int ky=0;ky<u_kH;ky++){int iy=oy*u_sH+ky-u_pH;if(iy<0||iy>=u_iH)continue;
+    for(int kx=0;kx<u_kW;kx++){int ix=ox*u_sW+kx-u_pW;if(ix<0||ix>=u_iW)continue;
+      vec4 inp=texelFetch(u_inp,ivec2(ix,iy*u_iCG+ocg),0);
+      for(int q=0;q<4;q++){int oc=oc0+q;if(oc>=u_oC)break;s[q]+=inp[q]*rw(oc*u_kH*u_kW+ky*u_kW+kx);}
+    }}
+  } else {
+    int opg=u_oC/u_grp,ipg=u_iC/u_grp;
+    for(int q=0;q<4;q++){int oc=oc0+q;if(oc>=u_oC)break;
+      int g=oc/opg,ist=g*ipg;float a=0.0;
+      for(int ky=0;ky<u_kH;ky++){int iy=oy*u_sH+ky-u_pH;if(iy<0||iy>=u_iH)continue;
+      for(int kx=0;kx<u_kW;kx++){int ix=ox*u_sW+kx-u_pW;if(ix<0||ix>=u_iW)continue;
+      for(int ic=ist;ic<ist+ipg;ic++){
+        int icg=ic>>2,ics=ic&3;
+        vec4 inp=texelFetch(u_inp,ivec2(ix,iy*u_iCG+icg),0);
+        float iv=ics==0?inp.r:ics==1?inp.g:ics==2?inp.b:inp.a;
+        a+=iv*rw(((oc*ipg+(ic-ist))*u_kH+ky)*u_kW+kx);
+      }}}
+      s[q]=a;
+    }
+  }
+  fc=s;
+}`;
+
+const FS_ELEM=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_i0,u_i1;
+uniform float u_sc,u_al,u_be;
+uniform int u_mode;
+out vec4 fc;
+void main(){
+  ivec2 c=ivec2(gl_FragCoord.xy);
+  vec4 a=texelFetch(u_i0,c,0),r;
+  if(u_mode==0)r=max(a,vec4(0));
+  else if(u_mode==1)r=vec4(1)/(vec4(1)+exp(-a));
+  else if(u_mode==2)r=clamp(a*u_al+u_be,0.0,1.0);
+  else if(u_mode==3){vec4 xa=abs(a);vec4 t=vec4(1)/(vec4(1)+0.3275911*xa);
+    r=sign(a)*(vec4(1)-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*exp(-(a*a)));}
+  else if(u_mode==4)r=a+u_sc;
+  else if(u_mode==5)r=a*u_sc;
+  else if(u_mode==6)r=a/u_sc;
+  else if(u_mode==7)r=a+texelFetch(u_i1,c,0);
+  else if(u_mode==8)r=a*texelFetch(u_i1,c,0);
+  else r=a;
+  fc=r;
+}`;
+
+const FS_AFFINE=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_scale,u_offset;
+uniform int u_CG;
+out vec4 fc;
+void main(){
+  int fx=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int cg=fy-fy/u_CG*u_CG;
+  fc=texelFetch(u_inp,ivec2(fx,fy),0)*texelFetch(u_scale,ivec2(0,cg),0)+texelFetch(u_offset,ivec2(0,cg),0);
+}`;
+
+const FS_CHMUL=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_ch;
+uniform int u_CG;
+out vec4 fc;
+void main(){
+  int fy=int(gl_FragCoord.y);
+  int cg=fy-fy/u_CG*u_CG;
+  fc=texelFetch(u_inp,ivec2(int(gl_FragCoord.x),fy),0)*texelFetch(u_ch,ivec2(0,cg),0);
+}`;
+
+const FS_REDUCE=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_iCG,u_iH,u_iW;
+out vec4 fc;
+void main(){
+  int cg=int(gl_FragCoord.y);
+  vec4 s=vec4(0);
+  for(int y=0;y<u_iH;y++)for(int x=0;x<u_iW;x++)s+=texelFetch(u_inp,ivec2(x,y*u_iCG+cg),0);
+  fc=s/float(u_iH*u_iW);
+}`;
+
+const FS_POOL=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_iCG,u_oCG,u_iH,u_iW,u_kH,u_kW,u_sH,u_sW,u_pT,u_pL,u_isMax;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_oCG,cg=fy-oy*u_oCG;
+  vec4 r=u_isMax==1?vec4(-1e30):vec4(0);float cnt=0.0;
+  for(int ky=0;ky<u_kH;ky++){int iy=oy*u_sH+ky-u_pT;if(iy<0||iy>=u_iH)continue;
+  for(int kx=0;kx<u_kW;kx++){int ix=ox*u_sW+kx-u_pL;if(ix<0||ix>=u_iW)continue;
+    vec4 v=texelFetch(u_inp,ivec2(ix,iy*u_iCG+cg),0);
+    if(u_isMax==1)r=max(r,v);else{r+=v;cnt+=1.0;}
+  }}
+  fc=u_isMax==1?r:(cnt>0.0?r/cnt:vec4(0));
+}`;
+
+const FS_RESIZE=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_iCG,u_sH,u_sW;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_iCG,cg=fy-oy*u_iCG;
+  fc=texelFetch(u_inp,ivec2(ox/u_sW,oy/u_sH*u_iCG+cg),0);
+}`;
+
+const FS_CONVTR=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_wt;
+uniform int u_iC,u_oC,u_iH,u_iW,u_kH,u_kW,u_sH,u_sW,u_iCG,u_oCG,u_wB,u_wTW;
+out vec4 fc;
+float rw(int i){i+=u_wB;int t=i>>2,c=i&3;vec4 v=texelFetch(u_wt,ivec2(t%u_wTW,t/u_wTW),0);return c==0?v.r:c==1?v.g:c==2?v.b:v.a;}
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_oCG,ocg=fy-oy*u_oCG,oc0=ocg*4;
+  vec4 s=vec4(0);
+  for(int ky=0;ky<u_kH;ky++){int iyN=oy-ky;if(iyN<0||iyN%u_sH!=0)continue;int iy=iyN/u_sH;if(iy>=u_iH)continue;
+  for(int kx=0;kx<u_kW;kx++){int ixN=ox-kx;if(ixN<0||ixN%u_sW!=0)continue;int ix=ixN/u_sW;if(ix>=u_iW)continue;
+    for(int icg=0;icg<u_iCG;icg++){vec4 inp=texelFetch(u_inp,ivec2(ix,iy*u_iCG+icg),0);
+    for(int ics=0;ics<4;ics++){int ic=icg*4+ics;if(ic>=u_iC)break;
+      float iv=ics==0?inp.r:ics==1?inp.g:ics==2?inp.b:inp.a;
+      for(int q=0;q<4;q++){int oc=oc0+q;if(oc>=u_oC)break;
+        s[q]+=iv*rw(((ic*u_oC+oc)*u_kH+ky)*u_kW+kx);}
+    }}
+  }}
+  fc=s;
+}`;
+
+const FS_CONCAT=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_i0,u_i1,u_i2,u_i3;
+uniform int u_c0,u_c1,u_c2,u_c3,u_cg0,u_cg1,u_cg2,u_cg3,u_num,u_oCG;
+out vec4 fc;
+void main(){
+  int fx=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int sy=fy/u_oCG,ocg=fy-sy*u_oCG,oc=ocg*4;
+  if(oc<u_c0){fc=texelFetch(u_i0,ivec2(fx,sy*u_cg0+ocg),0);}
+  else if(oc<u_c0+u_c1){int lc=oc-u_c0;fc=texelFetch(u_i1,ivec2(fx,sy*u_cg1+(lc>>2)),0);}
+  else if(u_num>2&&oc<u_c0+u_c1+u_c2){int lc=oc-u_c0-u_c1;fc=texelFetch(u_i2,ivec2(fx,sy*u_cg2+(lc>>2)),0);}
+  else{int lc=oc-u_c0-u_c1-u_c2;fc=texelFetch(u_i3,ivec2(fx,sy*u_cg3+(lc>>2)),0);}
+}`;
+
+const FS_CONV1X1=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_wt;
+uniform int u_iC,u_iCG,u_oCG,u_sH,u_sW,u_wB,u_wTW;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_oCG,ocg=fy-oy*u_oCG,oc0=ocg*4;
+  int ix=ox*u_sW,iy=oy*u_sH;
+  vec4 s=vec4(0);
+  for(int icg=0;icg<u_iCG;icg++){
+    vec4 inp=texelFetch(u_inp,ivec2(ix,iy*u_iCG+icg),0);
+    for(int q=0;q<4;q++){
+      int fi=u_wB+(oc0+q)*u_iC+(icg<<2);
+      int t=fi>>2;
+      s[q]+=dot(inp,texelFetch(u_wt,ivec2(t%u_wTW,t/u_wTW),0));
+    }
+  }
+  fc=s;
+}`;
+
+const FS_DW_CONV=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_wt;
+uniform int u_C,u_iH,u_iW,u_kH,u_kW,u_sH,u_sW,u_pH,u_pW,u_CG;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_CG,cg=fy-oy*u_CG;
+  vec4 s=vec4(0);
+  for(int ky=0;ky<u_kH;ky++){int iy=oy*u_sH+ky-u_pH;if(iy<0||iy>=u_iH)continue;
+  for(int kx=0;kx<u_kW;kx++){int ix=ox*u_sW+kx-u_pW;if(ix<0||ix>=u_iW)continue;
+    s+=texelFetch(u_inp,ivec2(ix,iy*u_CG+cg),0)*texelFetch(u_wt,ivec2(ky*u_kW+kx,cg),0);
+  }}
+  fc=s;
+}`;
+
+const FS_MATMUL=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_a,u_b;
+uniform int u_K,u_KG;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),m=int(gl_FragCoord.y);
+  vec4 s=vec4(0);
+  for(int kg=0;kg<u_KG;kg++){
+    vec4 a=texelFetch(u_a,ivec2(kg,m),0);
+    int k0=kg*4;
+    s+=a.r*texelFetch(u_b,ivec2(ox,k0),0);
+    s+=a.g*texelFetch(u_b,ivec2(ox,k0+1),0);
+    s+=a.b*texelFetch(u_b,ivec2(ox,k0+2),0);
+    s+=a.a*texelFetch(u_b,ivec2(ox,k0+3),0);
+  }
+  fc=s;
+}`;
+
+const FS_STD_CONV=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_wt;
+uniform int u_iCG,u_oCG,u_iH,u_iW,u_kH,u_kW,u_sH,u_sW,u_pH,u_pW,u_kHW;
+out vec4 fc;
+void main(){
+  int ox=int(gl_FragCoord.x),fy=int(gl_FragCoord.y);
+  int oy=fy/u_oCG,ocg=fy-oy*u_oCG,oc0=ocg*4;
+  vec4 s=vec4(0);
+  for(int ky=0;ky<u_kH;ky++){int iy=oy*u_sH+ky-u_pH;if(iy<0||iy>=u_iH)continue;
+  for(int kx=0;kx<u_kW;kx++){int ix=ox*u_sW+kx-u_pW;if(ix<0||ix>=u_iW)continue;
+    int wRow=ky*u_kW+kx;
+    for(int icg=0;icg<u_iCG;icg++){
+      vec4 inp=texelFetch(u_inp,ivec2(ix,iy*u_iCG+icg),0);
+      s.r+=dot(inp,texelFetch(u_wt,ivec2(icg,oc0*u_kHW+wRow),0));
+      s.g+=dot(inp,texelFetch(u_wt,ivec2(icg,(oc0+1)*u_kHW+wRow),0));
+      s.b+=dot(inp,texelFetch(u_wt,ivec2(icg,(oc0+2)*u_kHW+wRow),0));
+      s.a+=dot(inp,texelFetch(u_wt,ivec2(icg,(oc0+3)*u_kHW+wRow),0));
+    }
+  }}
+  fc=s;
+}`;
+
+const FS_ST_TO_MT=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_W,u_CG;
+out vec4 fc;
+void main(){
+  int cg=int(gl_FragCoord.x),t=int(gl_FragCoord.y);
+  int y=t/u_W,x=t-y*u_W;
+  fc=texelFetch(u_inp,ivec2(x,y*u_CG+cg),0);
+}`;
+
+const FS_MT_TO_ST=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+out vec4 fc;
+void main(){
+  int x=int(gl_FragCoord.x),cg=int(gl_FragCoord.y);
+  fc=texelFetch(u_inp,ivec2(cg,x),0);
+}`;
+
+const FS_MT_LAYERNORM=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_gamma,u_beta;
+uniform int u_N,u_NG;
+uniform float u_eps;
+out vec4 fc;
+void main(){
+  int ng=int(gl_FragCoord.x),m=int(gl_FragCoord.y);
+  float sum=0.0;
+  for(int g=0;g<u_NG;g++){vec4 v=texelFetch(u_inp,ivec2(g,m),0);int b=g*4;
+    sum+=v.r;if(b+1<u_N)sum+=v.g;if(b+2<u_N)sum+=v.b;if(b+3<u_N)sum+=v.a;}
+  float mean=sum/float(u_N);
+  float vs=0.0;
+  for(int g=0;g<u_NG;g++){vec4 v=texelFetch(u_inp,ivec2(g,m),0)-mean;int b=g*4;
+    vs+=v.r*v.r;if(b+1<u_N)vs+=v.g*v.g;if(b+2<u_N)vs+=v.b*v.b;if(b+3<u_N)vs+=v.a*v.a;}
+  float invStd=1.0/sqrt(vs/float(u_N)+u_eps);
+  vec4 inp=texelFetch(u_inp,ivec2(ng,m),0);
+  fc=(inp-mean)*invStd*texelFetch(u_gamma,ivec2(ng,0),0)+texelFetch(u_beta,ivec2(ng,0),0);
+}`;
+
+const FS_MT_SOFTMAX=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_N,u_NG;
+out vec4 fc;
+void main(){
+  int ng=int(gl_FragCoord.x),m=int(gl_FragCoord.y);
+  float mx=-1e30;
+  for(int g=0;g<u_NG;g++){vec4 v=texelFetch(u_inp,ivec2(g,m),0);int b=g*4;
+    mx=max(mx,v.r);if(b+1<u_N)mx=max(mx,v.g);if(b+2<u_N)mx=max(mx,v.b);if(b+3<u_N)mx=max(mx,v.a);}
+  float se=0.0;
+  for(int g=0;g<u_NG;g++){vec4 v=texelFetch(u_inp,ivec2(g,m),0);int b=g*4;
+    se+=exp(v.r-mx);if(b+1<u_N)se+=exp(v.g-mx);if(b+2<u_N)se+=exp(v.b-mx);if(b+3<u_N)se+=exp(v.a-mx);}
+  fc=exp(texelFetch(u_inp,ivec2(ng,m),0)-mx)/se;
+}`;
+
+const FS_MT_ADD_BIAS=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp,u_bias;
+out vec4 fc;
+void main(){ivec2 c=ivec2(gl_FragCoord.xy);fc=texelFetch(u_inp,c,0)+texelFetch(u_bias,ivec2(c.x,0),0);}`;
+
+const FS_MT_QKV_SPLIT=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_T,u_qkvIdx;
+out vec4 fc;
+void main(){
+  int hdg=int(gl_FragCoord.x),ht=int(gl_FragCoord.y);
+  int h=ht/u_T,t=ht-h*u_T;
+  int col0=u_qkvIdx*192+h*24+hdg*4;
+  fc=texelFetch(u_inp,ivec2(col0>>2,t),0);
+}`;
+
+const FS_MT_ATTN_SCORE=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_q,u_k;
+uniform int u_T,u_DG;
+out vec4 fc;
+void main(){
+  int tg=int(gl_FragCoord.x),bt1=int(gl_FragCoord.y);
+  int b=bt1/u_T;
+  vec4 s=vec4(0);
+  for(int q=0;q<4;q++){int t2=tg*4+q;float d=0.0;
+    if(t2<u_T){for(int dg=0;dg<u_DG;dg++){
+      vec4 qv=texelFetch(u_q,ivec2(dg,bt1),0);
+      vec4 kv=texelFetch(u_k,ivec2(dg,b*u_T+t2),0);
+      d+=dot(qv,kv);}}
+    s[q]=d;}
+  fc=s;
+}`;
+
+const FS_MT_BATCHED_MM=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_a,u_b;
+uniform int u_M,u_K,u_KG;
+out vec4 fc;
+void main(){
+  int ng=int(gl_FragCoord.x),bm=int(gl_FragCoord.y);
+  int b=bm/u_M;
+  vec4 s=vec4(0);
+  for(int kg=0;kg<u_KG;kg++){
+    vec4 a=texelFetch(u_a,ivec2(kg,bm),0);
+    int k0=b*u_K+kg*4;
+    s+=a.r*texelFetch(u_b,ivec2(ng,k0),0);
+    s+=a.g*texelFetch(u_b,ivec2(ng,k0+1),0);
+    s+=a.b*texelFetch(u_b,ivec2(ng,k0+2),0);
+    s+=a.a*texelFetch(u_b,ivec2(ng,k0+3),0);
+  }
+  fc=s;
+}`;
+
+const FS_MT_HEAD_CONCAT=`#version 300 es
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D u_inp;
+uniform int u_T;
+out vec4 fc;
+void main(){
+  int ng=int(gl_FragCoord.x),t=int(gl_FragCoord.y);
+  int col0=ng*4,h=col0/24,hd0=col0-h*24;
+  fc=texelFetch(u_inp,ivec2(hd0>>2,h*u_T+t),0);
+}`;
+
+// ============ SHADER COMPILATION ============
+function compSh(type,src){
+  const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(s));return null;}
+  return s;
+}
+function mkProg(vsSrc,fsSrc){
+  const vs=compSh(gl.VERTEX_SHADER,vsSrc),fs=compSh(gl.FRAGMENT_SHADER,fsSrc);
+  const p=gl.createProgram();gl.attachShader(p,vs);gl.attachShader(p,fs);
+  gl.bindAttribLocation(p,0,'a_pos');
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){console.error(gl.getProgramInfoLog(p));return null;}
+  return p;
+}
+
+const P={};
+P.conv=mkProg(VS,FS_CONV);
+P.elem=mkProg(VS,FS_ELEM);
+P.affine=mkProg(VS,FS_AFFINE);
+P.chmul=mkProg(VS,FS_CHMUL);
+P.reduce=mkProg(VS,FS_REDUCE);
+P.pool=mkProg(VS,FS_POOL);
+P.resize=mkProg(VS,FS_RESIZE);
+P.convtr=mkProg(VS,FS_CONVTR);
+P.concat=mkProg(VS,FS_CONCAT);
+P.matmul=mkProg(VS,FS_MATMUL);
+P.conv1x1=mkProg(VS,FS_CONV1X1);
+P.dwconv=mkProg(VS,FS_DW_CONV);
+P.stdConv=mkProg(VS,FS_STD_CONV);
+P.stToMt=mkProg(VS,FS_ST_TO_MT);
+P.mtToSt=mkProg(VS,FS_MT_TO_ST);
+P.mtLayerNorm=mkProg(VS,FS_MT_LAYERNORM);
+P.mtSoftmax=mkProg(VS,FS_MT_SOFTMAX);
+P.mtAddBias=mkProg(VS,FS_MT_ADD_BIAS);
+P.mtQkvSplit=mkProg(VS,FS_MT_QKV_SPLIT);
+P.mtAttnScore=mkProg(VS,FS_MT_ATTN_SCORE);
+P.mtBatchedMM=mkProg(VS,FS_MT_BATCHED_MM);
+P.mtHeadConcat=mkProg(VS,FS_MT_HEAD_CONCAT);
+
+// ============ GPU EXEC HELPER ============
+const ulCache=new Map();
+function getUL(prog,name){
+  let m=ulCache.get(prog);
+  if(!m){m=new Map();ulCache.set(prog,m);}
+  if(m.has(name))return m.get(name);
+  const l=gl.getUniformLocation(prog,name);
+  m.set(name,l);
+  return l;
+}
+
+function gpu(prog, outTex, outW, outH, texMap, intMap, floatMap){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,outTex,0);
+  gl.viewport(0,0,outW,outH);
+  gl.useProgram(prog);
+  let unit=0;
+  for(const [nm,tx] of Object.entries(texMap)){
+    gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tx);
+    gl.uniform1i(getUL(prog,nm),unit);unit++;
+  }
+  if(intMap)for(const [nm,v] of Object.entries(intMap)){
+    const l=getUL(prog,nm);if(l!==null)gl.uniform1i(l,v);
+  }
+  if(floatMap)for(const [nm,v] of Object.entries(floatMap)){
+    const l=getUL(prog,nm);if(l!==null)gl.uniform1f(l,v);
+  }
+  for(let u=unit;u<4;u++){gl.activeTexture(gl.TEXTURE0+u);gl.bindTexture(gl.TEXTURE_2D,null);}
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  gl.bindVertexArray(null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+
+// ============ SPATIAL TENSOR ============
+class ST {
+  constructor(C,H,W,tex){this.C=C;this.H=H;this.W=W;this.tex=tex;this.CG=Math.ceil(C/4);}
+  get texW(){return this.W;}
+  get texH(){return this.H*this.CG;}
+  free(){if(this.tex){recycleTex(this.tex,this.texW,this.texH);this.tex=null;}}
+  toCpu(){return spatialTexToCpu(this.tex,this.C,this.H,this.W);}
+}
+
+// ============ MATRIX TENSOR ============
+class MT {
+  constructor(M,N,tex){this.M=M;this.N=N;this.tex=tex;this.NG=Math.ceil(N/4);}
+  get texW(){return this.NG;}
+  get texH(){return this.M;}
+  free(){if(this.tex){recycleTex(this.tex,this.texW,this.texH);this.tex=null;}}
+  toCpu(){return texToMat(this.tex,this.M,this.N);}
+}
+
+function packStdConvWeights(wData,oC,iC,kH,kW){
+  const iCG=Math.ceil(iC/4),kHW=kH*kW;
+  const buf=new Float32Array(iCG*oC*kHW*4);
+  for(let oc=0;oc<oC;oc++)for(let ky=0;ky<kH;ky++)for(let kx=0;kx<kW;kx++)
+    for(let ic=0;ic<iC;ic++){
+      const icg=ic>>2,ics=ic&3,texY=oc*kHW+ky*kW+kx;
+      buf[(texY*iCG+icg)*4+ics]=wData[((oc*iC+ic)*kH+ky)*kW+kx];
+    }
+  return makeTex(iCG,oC*kHW,buf);
+}
+
+// ============ GPU OPS ============
+function computeSamePad(inSize,kSize,stride){
+  const outSize=Math.ceil(inSize/stride);
+  const totalPad=Math.max(0,(outSize-1)*stride+kSize-inSize);
+  return [Math.floor(totalPad/2), totalPad-Math.floor(totalPad/2), outSize];
+}
+function gpuConv(inp, wTex, wTexW, wOff, wShape, attrs){
+  const oC=wShape[0], iC=inp.C, kH=attrs.kernel_shape[0], kW=attrs.kernel_shape[1];
+  const sH=(attrs.strides||[1,1])[0], sW=(attrs.strides||[1,1])[1];
+  let pH,pW,oH,oW;
+  if(attrs.auto_pad==='SAME_UPPER'||attrs.auto_pad==='SAME_LOWER'){
+    const [pHT,pHB,oHc]=computeSamePad(inp.H,kH,sH);
+    const [pWT,pWR,oWc]=computeSamePad(inp.W,kW,sW);
+    pH=pHT; pW=pWT; oH=oHc; oW=oWc;
+  } else {
+    const pads=attrs.pads||[0,0,0,0];
+    pH=pads[0]; pW=pads[1];
+    oH=Math.floor((inp.H+pH+(pads[2]||0)-kH)/sH)+1;
+    oW=Math.floor((inp.W+pW+(pads[3]||0)-kW)/sW)+1;
+  }
+  const grp=attrs.group||1;
+  const realOC = grp===iC ? iC : oC;
+  const oCG=Math.ceil(realOC/4);
+  const [tw,th]=[oW,oH*oCG];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.conv,outTex,tw,th,
+    {u_inp:inp.tex,u_wt:wTex},
+    {u_iC:iC,u_oC:realOC,u_iH:inp.H,u_iW:inp.W,u_kH:kH,u_kW:kW,u_sH:sH,u_sW:sW,u_pH:pH,u_pW:pW,
+     u_grp:grp,u_iCG:inp.CG,u_oCG:oCG,u_wB:wOff>>2,u_wTW:wTexW},null);
+  return new ST(realOC,oH,oW,outTex);
+}
+
+function gpuElem(mode,inp0,inp1Tex,scalar,alpha,beta){
+  const [tw,th]=[inp0.texW,inp0.texH];
+  const outTex=makeOutTex(tw,th);
+  const texMap={u_i0:inp0.tex};
+  if(inp1Tex)texMap.u_i1=inp1Tex;
+  gpu(P.elem,outTex,tw,th,texMap,{u_mode:mode},{u_sc:scalar||0,u_al:alpha||0,u_be:beta||0});
+  return new ST(inp0.C,inp0.H,inp0.W,outTex);
+}
+
+function gpuAffine(inp,scaleTex,offsetTex){
+  const [tw,th]=[inp.texW,inp.texH];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.affine,outTex,tw,th,{u_inp:inp.tex,u_scale:scaleTex,u_offset:offsetTex},{u_CG:inp.CG},null);
+  return new ST(inp.C,inp.H,inp.W,outTex);
+}
+
+function gpuChMul(inp,chTex){
+  const [tw,th]=[inp.texW,inp.texH];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.chmul,outTex,tw,th,{u_inp:inp.tex,u_ch:chTex},{u_CG:inp.CG},null);
+  return new ST(inp.C,inp.H,inp.W,outTex);
+}
+
+function gpuReduceMean(inp){
+  const oCG=inp.CG;
+  const outTex=makeOutTex(1,oCG);
+  gpu(P.reduce,outTex,1,oCG,{u_inp:inp.tex},{u_iCG:inp.CG,u_iH:inp.H,u_iW:inp.W},null);
+  return new ST(inp.C,1,1,outTex);
+}
+
+function gpuPool(inp,kH,kW,sH,sW,pT,pL,isMax,oH,oW){
+  const oCG=inp.CG;
+  const [tw,th]=[oW,oH*oCG];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.pool,outTex,tw,th,{u_inp:inp.tex},
+    {u_iCG:inp.CG,u_oCG:oCG,u_iH:inp.H,u_iW:inp.W,u_kH:kH,u_kW:kW,u_sH:sH,u_sW:sW,u_pT:pT,u_pL:pL,u_isMax:isMax?1:0},null);
+  return new ST(inp.C,oH,oW,outTex);
+}
+
+function gpuResize(inp,scaleH,scaleW){
+  const oH=inp.H*scaleH, oW=inp.W*scaleW;
+  const [tw,th]=[oW,oH*inp.CG];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.resize,outTex,tw,th,{u_inp:inp.tex},{u_iCG:inp.CG,u_sH:scaleH,u_sW:scaleW},null);
+  return new ST(inp.C,oH,oW,outTex);
+}
+
+function gpuConvTranspose(inp,wTex,wTexW,wOff,wShape,attrs){
+  const iC=wShape[0], oC=wShape[1];
+  const kH=attrs.kernel_shape[0],kW=attrs.kernel_shape[1];
+  const sH=attrs.strides[0],sW=attrs.strides[1];
+  const oH=inp.H*sH, oW=inp.W*sW; // for stride=kernel, no padding
+  const oCG=Math.ceil(oC/4);
+  const [tw,th]=[oW,oH*oCG];
+  const outTex=makeOutTex(tw,th);
+  gpu(P.convtr,outTex,tw,th,{u_inp:inp.tex,u_wt:wTex},
+    {u_iC:inp.C,u_oC:oC,u_iH:inp.H,u_iW:inp.W,u_kH:kH,u_kW:kW,u_sH:sH,u_sW:sW,
+     u_iCG:inp.CG,u_oCG:oCG,u_wB:wOff>>2,u_wTW:wTexW},null);
+  return new ST(oC,oH,oW,outTex);
+}
+
+function gpuConcat(inputs){
+  let totalC=0;
+  for(const t of inputs) totalC+=t.C;
+  const H=inputs[0].H, W=inputs[0].W;
+  const oCG=Math.ceil(totalC/4);
+  const [tw,th]=[W,H*oCG];
+  const outTex=makeOutTex(tw,th);
+  const texMap={};
+  const names=['u_i0','u_i1','u_i2','u_i3'];
+  for(let i=0;i<inputs.length;i++) texMap[names[i]]=inputs[i].tex;
+  for(let i=inputs.length;i<4;i++) texMap[names[i]]=inputs[0].tex; // dummy
+  const cs=[0,0,0,0], cgs=[1,1,1,1];
+  for(let i=0;i<inputs.length;i++){cs[i]=inputs[i].C;cgs[i]=inputs[i].CG;}
+  gpu(P.concat,outTex,tw,th,texMap,
+    {u_c0:cs[0],u_c1:cs[1],u_c2:cs[2],u_c3:cs[3],u_cg0:cgs[0],u_cg1:cgs[1],u_cg2:cgs[2],u_cg3:cgs[3],
+     u_num:inputs.length,u_oCG:oCG},null);
+  return new ST(totalC,H,W,outTex);
+}
+
+// ============ GPU MATMUL ============
+function matToTex(data,rows,cols){
+  const CG=Math.ceil(cols/4);
+  const buf=new Float32Array(CG*rows*4);
+  for(let r=0;r<rows;r++){
+    const rOff=r*cols, bOff=r*CG*4;
+    for(let c=0;c<cols;c++) buf[bOff+((c>>2)*4)+(c&3)]=data[rOff+c];
+  }
+  return makeTex(CG,rows,buf);
+}
+function texToMat(tex,rows,cols){
+  const CG=Math.ceil(cols/4);
+  const raw=readTex(tex,CG,rows);
+  const out=new Float32Array(rows*cols);
+  for(let r=0;r<rows;r++){
+    const rOff=r*cols, bOff=r*CG*4;
+    for(let c=0;c<cols;c++) out[rOff+c]=raw[bOff+((c>>2)*4)+(c&3)];
+  }
+  return out;
+}
+function gpuMatMul2D(aTex,M,K,bTex,N){
+  const NG=Math.ceil(N/4), KG=Math.ceil(K/4);
+  const outTex=makeOutTex(NG,M);
+  gpu(P.matmul,outTex,NG,M,{u_a:aTex,u_b:bTex},{u_K:K,u_KG:KG},null);
+  return {tex:outTex,w:NG,h:M};
+}
+function gpuMatMulMT(aMT,bTex,N){
+  const M=aMT.M,K=aMT.N,KG=Math.ceil(K/4),NG=Math.ceil(N/4);
+  const outTex=makeOutTex(NG,M);
+  gpu(P.matmul,outTex,NG,M,{u_a:aMT.tex,u_b:bTex},{u_K:K,u_KG:KG},null);
+  return new MT(M,N,outTex);
+}
+
+function packDWWeights(wData,C,kH,kW){
+  const CG=Math.ceil(C/4);
+  const buf=new Float32Array(kH*kW*CG*4);
+  for(let c=0;c<C;c++){
+    const cg=c>>2,cs=c&3;
+    for(let ky=0;ky<kH;ky++)for(let kx=0;kx<kW;kx++)
+      buf[(cg*kH*kW+ky*kW+kx)*4+cs]=wData[c*kH*kW+ky*kW+kx];
+  }
+  return makeTex(kH*kW,CG,buf);
+}
+
+// ============ CPU OPS ============
+function cpuMatMul(a,aShape,b,bShape){
+  const aR=aShape.length, bR=bShape.length;
+  const M=aShape[aR-2]||1, K=aShape[aR-1], N=bShape[bR-1];
+  const aBatch=aR>2?aShape.slice(0,-2):[1];
+  const bBatch=bR>2?bShape.slice(0,-2):[1];
+  const maxBR=Math.max(aBatch.length,bBatch.length);
+  const outBatch=[];
+  for(let i=0;i<maxBR;i++){
+    const ai=i<aBatch.length?aBatch[aBatch.length-1-i]:1;
+    const bi=i<bBatch.length?bBatch[bBatch.length-1-i]:1;
+    outBatch.unshift(Math.max(ai,bi));
+  }
+  const totalB=outBatch.reduce((x,y)=>x*y,1);
+  const aBatchSz=aBatch.reduce((x,y)=>x*y,1);
+  const bBatchSz=bBatch.reduce((x,y)=>x*y,1);
+  const out=new Float32Array(totalB*M*N);
+  for(let bi=0;bi<totalB;bi++){
+    const aOff=(aBatchSz===1?0:bi)*M*K;
+    const bOff=(bBatchSz===1?0:bi)*K*N;
+    const oOff=bi*M*N;
+    for(let m=0;m<M;m++){
+      const oBase=oOff+m*N, aBase=aOff+m*K;
+      for(let k=0;k<K;k++){
+        const aVal=a[aBase+k], bBase=bOff+k*N;
+        for(let n=0;n<N;n++) out[oBase+n]+=aVal*b[bBase+n];
+      }
+    }
+  }
+  return {data:out,shape:[...outBatch,M,N]};
+}
+
+// Proper numpy-style broadcast for element-wise ops
+function broadcastIndex(flatIdx, dstShape, srcShape) {
+  const rank = dstShape.length;
+  const srcRank = srcShape.length;
+  let rem = flatIdx, srcIdx = 0, srcStride = 1;
+  // Compute src strides
+  const srcStrides = new Array(srcRank);
+  srcStrides[srcRank - 1] = 1;
+  for (let i = srcRank - 2; i >= 0; i--) srcStrides[i] = srcStrides[i + 1] * srcShape[i + 1];
+  // Map each dimension
+  const dstStrides = new Array(rank);
+  dstStrides[rank - 1] = 1;
+  for (let i = rank - 2; i >= 0; i--) dstStrides[i] = dstStrides[i + 1] * dstShape[i + 1];
+
+  srcIdx = 0;
+  rem = flatIdx;
+  for (let i = 0; i < rank; i++) {
+    const di = Math.floor(rem / dstStrides[i]);
+    rem -= di * dstStrides[i];
+    const srcDim = i - (rank - srcRank);
+    if (srcDim >= 0 && srcShape[srcDim] > 1) {
+      srcIdx += di * srcStrides[srcDim];
+    }
+  }
+  return srcIdx;
+}
+
+function broadcastOp(d0, s0, d1, s1, fn) {
+  const r = new Float32Array(d0.length);
+  if (d1.length === d0.length) {
+    for (let j = 0; j < d0.length; j++) r[j] = fn(d0[j], d1[j]);
+  } else {
+    for (let j = 0; j < d0.length; j++) r[j] = fn(d0[j], d1[broadcastIndex(j, s0, s1)]);
+  }
+  return r;
+}
+
+function cpuSoftmax(data,shape,axis){
+  const a=axis<0?axis+shape.length:axis;
+  const outerSize=shape.slice(0,a).reduce((x,y)=>x*y,1);
+  const dimSize=shape[a];
+  const innerSize=shape.slice(a+1).reduce((x,y)=>x*y,1);
+  const out=new Float32Array(data.length);
+  for(let o=0;o<outerSize;o++){
+    for(let i=0;i<innerSize;i++){
+      let mx=-Infinity;
+      for(let d=0;d<dimSize;d++) mx=Math.max(mx,data[(o*dimSize+d)*innerSize+i]);
+      let sm=0;
+      for(let d=0;d<dimSize;d++){const e=Math.exp(data[(o*dimSize+d)*innerSize+i]-mx);out[(o*dimSize+d)*innerSize+i]=e;sm+=e;}
+      for(let d=0;d<dimSize;d++) out[(o*dimSize+d)*innerSize+i]/=sm;
+    }
+  }
+  return out;
+}
+
+function cpuTranspose(data,shape,perm){
+  const rank=shape.length;
+  const outShape=perm.map(p=>shape[p]);
+  const out=new Float32Array(data.length);
+  const inStrides=new Array(rank);
+  inStrides[rank-1]=1;
+  for(let i=rank-2;i>=0;i--) inStrides[i]=inStrides[i+1]*shape[i+1];
+  const outStrides=new Array(rank);
+  outStrides[rank-1]=1;
+  for(let i=rank-2;i>=0;i--) outStrides[i]=outStrides[i+1]*outShape[i+1];
+  const total=data.length;
+  for(let oi=0;oi<total;oi++){
+    let rem=oi;
+    const outIdx=new Array(rank);
+    for(let d=0;d<rank;d++){outIdx[d]=Math.floor(rem/outStrides[d]);rem-=outIdx[d]*outStrides[d];}
+    let ii=0;
+    for(let d=0;d<rank;d++) ii+=outIdx[d]*inStrides[perm[d]];
+    out[oi]=data[ii];
+  }
+  return {data:out,shape:outShape};
+}
+
+function cpuReduceMean(data,shape,axes,keepdims){
+  const rank=shape.length;
+  const axSet=new Set(axes.map(a=>a<0?a+rank:a));
+  const outShape=shape.map((s,i)=>axSet.has(i)?(keepdims?1:null):s).filter(x=>x!==null);
+  if(keepdims) for(let i=0;i<rank;i++) if(axSet.has(i)) outShape[i]=1; // fix
+  // Compute properly
+  const outShape2=[];
+  for(let i=0;i<rank;i++) outShape2.push(axSet.has(i)?(keepdims?1:-1):shape[i]);
+  const finalShape=outShape2.filter(x=>x!==-1);
+  const outSize=finalShape.reduce((a,b)=>a*b,1);
+  const out=new Float32Array(outSize);
+  const cnt=new Float32Array(outSize);
+  const strides=new Array(rank);
+  strides[rank-1]=1;
+  for(let i=rank-2;i>=0;i--) strides[i]=strides[i+1]*shape[i+1];
+  const outRank=finalShape.length;
+  const outStrides=new Array(outRank);
+  if(outRank>0){outStrides[outRank-1]=1;for(let i=outRank-2;i>=0;i--)outStrides[i]=outStrides[i+1]*finalShape[i+1];}
+  const total=data.length;
+  for(let i=0;i<total;i++){
+    let rem=i;
+    let oi=0, od=0;
+    for(let d=0;d<rank;d++){
+      const idx=Math.floor(rem/strides[d]);rem-=idx*strides[d];
+      if(!axSet.has(d)){oi+=idx*outStrides[od];od++;}
+    }
+    out[oi]+=data[i];cnt[oi]++;
+  }
+  for(let i=0;i<outSize;i++) out[i]/=cnt[i];
+  return {data:out,shape:finalShape};
+}
+
+// ============ GRAPH EXECUTOR ============
+class GraphExec {
+  constructor(manifest,detWT,recWT){
+    this.manifest=manifest;
+    this.detWT=detWT;
+    this.recWT=recWT;
+    this.chars=manifest.chars;
+    this.matWeightCache=new Map();
+    this.dwConvWtCache=new Map();
+    this.stdConvWtCache=new Map();
+  }
+
+  async runModel(modelName,inputST){
+    const model=this.manifest[modelName];
+    const ops=model.ops;
+    const weights=model.weights;
+    const wt=modelName==='det'?this.detWT:this.recWT;
+
+    const lastUse={};
+    for(let i=ops.length-1;i>=0;i--){
+      for(const inp of ops[i].inputs){
+        if(inp.type==='tensor'&&!(inp.name in lastUse)) lastUse[inp.name]=i;
+      }
+    }
+
+    const tensors={};
+    tensors['x']=inputST;
+    const cpuTensors={};
+
+    const opTime={};
+    this._recGpuDone=false;
+    for(let i=0;i<ops.length;i++){
+      const op=ops[i];
+      const outName=op.outputs[0];
+
+      // GPU transformer fast path for rec model
+      if(modelName==='rec'&&op.op==='Reshape'&&!this._recGpuDone){
+        const stInput=tensors[op.inputs[0].name];
+        if(stInput&&stInput instanceof ST&&stInput.C>64){
+          this._recGpuDone=true;
+          let skipName=null;
+          for(let j=ops.length-1;j>i;j--){
+            if(ops[j].op==='Add'){
+              for(const inp of ops[j].inputs){
+                if(inp.type==='tensor'&&tensors[inp.name]&&tensors[inp.name] instanceof ST&&inp.name!==op.inputs[0].name)
+                  {skipName=inp.name;break;}
+              }
+              if(skipName)break;
+            }
+          }
+          const skipST=skipName?tensors[skipName]:null;
+          const t0=performance.now();
+          const result=this._runRecTransformerGPU(stInput,skipST,ops,weights,wt);
+          const dt=performance.now()-t0;
+          const finalName=ops[ops.length-1].outputs[0];
+          cpuTensors[finalName]=result;
+          for(const name in tensors){if(tensors[name]&&tensors[name].tex)tensors[name].free();}
+          break;
+        }
+      }
+
+      try{
+        const t0=performance.now();
+        this._execOp(op,i,tensors,cpuTensors,weights,wt,false);
+        const dt=performance.now()-t0;
+        opTime[op.op]=(opTime[op.op]||0)+dt;
+        if(i%50===0){await new Promise(r=>setTimeout(r,0));}
+      }catch(e){
+        const inDescs=op.inputs.map(inp=>{
+          if(inp.type==='tensor'){
+            const t=tensors[inp.name];const c=cpuTensors[inp.name];
+            if(t)return `gpu[${t.C},${t.H},${t.W}]`;if(c)return `cpu[${c.shape}]`;return `missing:${inp.name}`;
+          }
+          return inp.type;
+        });
+        console.error(`Op ${i} ${op.op} inputs=${JSON.stringify(inDescs)} failed:`,e);
+        throw e;
+      }
+
+      for(const inp of op.inputs){
+        if(inp.type==='tensor'&&lastUse[inp.name]===i){
+          if(tensors[inp.name]){tensors[inp.name].free();delete tensors[inp.name];}
+          delete cpuTensors[inp.name];
+        }
+      }
+    }
+
+    const topOps=Object.entries(opTime).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+    const finalName=ops[ops.length-1].outputs[0];
+    let result;
+    if(cpuTensors[finalName]) result=cpuTensors[finalName];
+    else if(tensors[finalName]) result={data:tensors[finalName].toCpu(),shape:[tensors[finalName].C,tensors[finalName].H,tensors[finalName].W]};
+    else throw new Error('No output');
+
+    // Clean up ALL remaining GPU textures to prevent cross-run contamination
+    for(const name in tensors){if(tensors[name]&&tensors[name].tex){tensors[name].free();}}
+    return result;
+  }
+
+  _resolveInput(inp,tensors,cpuTensors,weights,wt){
+    if(inp.type==='tensor'){
+      if(cpuTensors[inp.name]) return {type:'cpu',...cpuTensors[inp.name]};
+      if(tensors[inp.name]) return {type:'gpu',st:tensors[inp.name]};
+      throw new Error('Missing tensor: '+inp.name);
+    }
+    if(inp.type==='weight'){
+      const w=weights[inp.name];
+      return {type:'weight',offset:w.offset,shape:w.shape,size:w.size,name:inp.name};
+    }
+    if(inp.type==='const') return {type:'const',value:inp.value};
+    if(inp.type==='empty') return {type:'empty'};
+    if(inp.type==='none') return {type:'none'};
+    return {type:'unknown'};
+  }
+
+  _getWeightData(w,wt){
+    return new Float32Array(wt.buf,w.offset,w.size);
+  }
+
+  _execOp(op,idx,tensors,cpuTensors,weights,wt,forceCpu){
+    const ins=op.inputs.map(inp=>this._resolveInput(inp,tensors,cpuTensors,weights,wt));
+    const out=op.outputs[0];
+    const a=op.attrs||{};
+
+    // Check if any tensor input is CPU -> force CPU
+    const anyCpu=ins.some(i=>i.type==='cpu');
+    const anyGpu=ins.some(i=>i.type==='gpu');
+
+    // Convert GPU inputs to CPU if needed
+    if(anyCpu && anyGpu){
+      for(let j=0;j<ins.length;j++){
+        if(ins[j].type==='gpu'){
+          const st=ins[j].st;
+          cpuTensors[op.inputs[j].name]={data:st.toCpu(),shape:[st.C,st.H,st.W]};
+          ins[j]={type:'cpu',...cpuTensors[op.inputs[j].name]};
+        }
+      }
+    }
+
+    const isCpu=anyCpu||forceCpu;
+
+    switch(op.op){
+      case 'Conv': return this._opConv(out,ins,a,tensors,cpuTensors,weights,wt,isCpu);
+      case 'Add': return this._opAdd(out,ins,a,tensors,cpuTensors,weights,wt,isCpu);
+      case 'Relu': return this._opUnary(out,ins,0,tensors,cpuTensors,isCpu);
+      case 'Sigmoid': return this._opUnary(out,ins,1,tensors,cpuTensors,isCpu);
+      case 'HardSigmoid': return this._opHardSig(out,ins,a,tensors,cpuTensors,isCpu);
+      case 'Erf': return this._opUnary(out,ins,3,tensors,cpuTensors,isCpu);
+      case 'Mul': return this._opMul(out,ins,a,tensors,cpuTensors,weights,wt,isCpu);
+      case 'Div': return this._opDiv(out,ins,tensors,cpuTensors,isCpu);
+      case 'Sub': return this._opSub(out,ins,tensors,cpuTensors);
+      case 'Pow': return this._opPow(out,ins,cpuTensors);
+      case 'Sqrt': return this._opSqrt(out,ins,cpuTensors);
+      case 'ReduceMean': return this._opReduceMean(out,ins,a,tensors,cpuTensors,isCpu);
+      case 'MaxPool': return this._opPool(out,ins,a,tensors,cpuTensors,true);
+      case 'AveragePool': return this._opPool(out,ins,a,tensors,cpuTensors,false);
+      case 'Resize': return this._opResize(out,ins,a,tensors);
+      case 'ConvTranspose': return this._opConvTranspose(out,ins,a,tensors,weights,wt);
+      case 'BatchNormalization': return this._opBatchNorm(out,ins,a,tensors,cpuTensors,weights,wt,isCpu);
+      case 'Concat': return this._opConcat(out,ins,op.inputs,a,tensors,cpuTensors,isCpu);
+      case 'Softmax': return this._opSoftmax(out,ins,a,cpuTensors);
+      case 'MatMul': return this._opMatMul(out,ins,tensors,cpuTensors,weights,wt);
+      case 'Reshape': return this._opReshape(out,ins,tensors,cpuTensors);
+      case 'Transpose': return this._opTranspose(out,ins,a,cpuTensors);
+      case 'Shape': return this._opShape(out,ins,tensors,cpuTensors);
+      case 'Slice': return this._opSlice(out,ins,cpuTensors);
+      case 'Squeeze': return this._opSqueeze(out,ins,cpuTensors);
+      case 'Unsqueeze': return this._opUnsqueeze(out,ins,cpuTensors);
+      default: throw new Error('Unknown op: '+op.op);
+    }
+  }
+
+  _opConv(out,ins,a,tensors,cpuTensors,weights,wt,isCpu){
+    if(isCpu) return this._opConvCpu(out,ins,a,cpuTensors,weights,wt);
+    const inp=ins[0].st;
+    const w=ins[1];
+    const kH=a.kernel_shape?a.kernel_shape[0]:w.shape[2];
+    const kW=a.kernel_shape?a.kernel_shape[1]:w.shape[3];
+    const grp=a.group||1;
+    const oC=w.shape[0];
+    // 1×1 standard conv → optimized dot-product shader
+    if(USE_CONV1X1&&kH===1&&kW===1&&grp===1&&((w.offset>>2)%4)===0){
+      const iC=inp.C;
+      const sH=(a.strides||[1,1])[0],sW=(a.strides||[1,1])[1];
+      const oH=Math.ceil(inp.H/sH),oW=Math.ceil(inp.W/sW);
+      const oCG=Math.ceil(oC/4);
+      const [tw,th]=[oW,oH*oCG];
+      const outTex=makeOutTex(tw,th);
+      gpu(P.conv1x1,outTex,tw,th,{u_inp:inp.tex,u_wt:wt.tex},
+        {u_iC:iC,u_iCG:inp.CG,u_oCG:oCG,u_sH:sH,u_sW:sW,u_wB:w.offset>>2,u_wTW:wt.texW},null);
+      tensors[out]=new ST(oC,oH,oW,outTex);
+      return;
+    }
+    // Depthwise conv → optimized vec4 shader
+    if(USE_DW_CONV&&grp===inp.C&&grp===oC){
+      const sH=(a.strides||[1,1])[0],sW=(a.strides||[1,1])[1];
+      let pH,pW,oH,oW;
+      if(a.auto_pad==='SAME_UPPER'||a.auto_pad==='SAME_LOWER'){
+        [pH,,oH]=computeSamePad(inp.H,kH,sH);[pW,,oW]=computeSamePad(inp.W,kW,sW);
+      }else{
+        const pads=a.pads||[0,0,0,0];pH=pads[0];pW=pads[1];
+        oH=Math.floor((inp.H+pH+(pads[2]||0)-kH)/sH)+1;
+        oW=Math.floor((inp.W+pW+(pads[3]||0)-kW)/sW)+1;
+      }
+      if(!this.dwConvWtCache.has(w.name)){
+        const wd=this._getWeightData(w,wt);
+        this.dwConvWtCache.set(w.name,packDWWeights(wd,oC,kH,kW));
+      }
+      const CG=Math.ceil(oC/4);
+      const [tw,th]=[oW,oH*CG];
+      const outTex=makeOutTex(tw,th);
+      gpu(P.dwconv,outTex,tw,th,{u_inp:inp.tex,u_wt:this.dwConvWtCache.get(w.name)},
+        {u_C:oC,u_CG:CG,u_iH:inp.H,u_iW:inp.W,u_kH:kH,u_kW:kW,u_sH:sH,u_sW:sW,u_pH:pH,u_pW:pW},null);
+      tensors[out]=new ST(oC,oH,oW,outTex);
+      return;
+    }
+    // Standard conv (group=1) → optimized dot-product shader with packed weights
+    if(grp===1){
+      const iC=inp.C;
+      const sH=(a.strides||[1,1])[0],sW=(a.strides||[1,1])[1];
+      let pH,pW,oH,oW;
+      if(a.auto_pad==='SAME_UPPER'||a.auto_pad==='SAME_LOWER'){
+        [pH,,oH]=computeSamePad(inp.H,kH,sH);[pW,,oW]=computeSamePad(inp.W,kW,sW);
+      }else{
+        const pads=a.pads||[0,0,0,0];pH=pads[0];pW=pads[1];
+        oH=Math.floor((inp.H+pH+(pads[2]||0)-kH)/sH)+1;
+        oW=Math.floor((inp.W+pW+(pads[3]||0)-kW)/sW)+1;
+      }
+      if(!this.stdConvWtCache.has(w.name)){
+        const wd=this._getWeightData(w,wt);
+        this.stdConvWtCache.set(w.name,packStdConvWeights(wd,oC,iC,kH,kW));
+      }
+      const oCG=Math.ceil(oC/4),kHW=kH*kW;
+      const [tw,th]=[oW,oH*oCG];
+      const outTex=makeOutTex(tw,th);
+      gpu(P.stdConv,outTex,tw,th,{u_inp:inp.tex,u_wt:this.stdConvWtCache.get(w.name)},
+        {u_iCG:inp.CG,u_oCG:oCG,u_iH:inp.H,u_iW:inp.W,u_kH:kH,u_kW:kW,u_sH:sH,u_sW:sW,u_pH:pH,u_pW:pW,u_kHW:kHW},null);
+      tensors[out]=new ST(oC,oH,oW,outTex);
+      return;
+    }
+    // General conv → original shader (grouped convs with group>1 and group<iC)
+    const r=gpuConv(inp,wt.tex,wt.texW,w.offset,w.shape,a);
+    tensors[out]=r;
+  }
+
+  _opConvCpu(out,ins,a,cpuTensors,weights,wt){
+    const inp=ins[0];
+    const w=ins[1];
+    const wData=this._getWeightData(w,wt);
+    const [oC,icpg,kH,kW]=w.shape;
+    const grp=a.group||1;
+    const iC=inp.shape[0],iH=inp.shape[1],iW=inp.shape[2];
+    const sH=(a.strides||[1,1])[0],sW=(a.strides||[1,1])[1];
+    let pH,pW,oH2,oW2;
+    if(a.auto_pad==='SAME_UPPER'||a.auto_pad==='SAME_LOWER'){
+      const[pHT,,oHc]=computeSamePad(iH,kH,sH);
+      const[pWT,,oWc]=computeSamePad(iW,kW,sW);
+      pH=pHT;pW=pWT;oH2=oHc;oW2=oWc;
+    }else{
+      const pads=a.pads||[0,0,0,0];
+      pH=pads[0];pW=pads[1];
+      oH2=Math.floor((iH+pH+(pads[2]||0)-kH)/sH)+1;
+      oW2=Math.floor((iW+pW+(pads[3]||0)-kW)/sW)+1;
+    }
+    const realOC=grp===iC?iC:oC;
+    const oH=oH2,oW=oW2;
+    const res=new Float32Array(realOC*oH*oW);
+    const inpD=inp.data;
+    if(grp===iC&&grp===realOC){
+      for(let c=0;c<realOC;c++)for(let oy=0;oy<oH;oy++)for(let ox=0;ox<oW;ox++){
+        let s=0;
+        for(let ky=0;ky<kH;ky++){const iy=oy*sH+ky-pH;if(iy<0||iy>=iH)continue;
+        for(let kx=0;kx<kW;kx++){const ix=ox*sW+kx-pW;if(ix<0||ix>=iW)continue;
+          s+=inpD[c*iH*iW+iy*iW+ix]*wData[c*kH*kW+ky*kW+kx];}}
+        res[c*oH*oW+oy*oW+ox]=s;
+      }
+    } else {
+      const opg=realOC/grp, ipg=iC/grp;
+      for(let oc=0;oc<realOC;oc++){const g=Math.floor(oc/opg),ist=g*ipg;
+        for(let oy=0;oy<oH;oy++)for(let ox=0;ox<oW;ox++){
+          let s=0;
+          for(let ic=ist;ic<ist+ipg;ic++)
+            for(let ky=0;ky<kH;ky++){const iy=oy*sH+ky-pH;if(iy<0||iy>=iH)continue;
+            for(let kx=0;kx<kW;kx++){const ix=ox*sW+kx-pW;if(ix<0||ix>=iW)continue;
+              s+=inpD[ic*iH*iW+iy*iW+ix]*wData[((oc*ipg+(ic-ist))*kH+ky)*kW+kx];}}
+          res[oc*oH*oW+oy*oW+ox]=s;
+        }
+      }
+    }
+    cpuTensors[out]={data:res,shape:[realOC,oH,oW]};
+  }
+
+  _opAdd(out,ins,a,tensors,cpuTensors,weights,wt,isCpu){
+    const i0=ins[0],i1=ins[1];
+    if(!isCpu && i0.type==='gpu' && i1.type==='weight'){
+      const w=i1;
+      if(w.shape.length===1){
+        const biasData=this._getWeightData(w,wt);
+        const C=w.shape[0];
+        const scaleTex=vecToTex(new Float32Array(C).fill(1),C);
+        const offsetTex=vecToTex(biasData,C);
+        const r=gpuAffine(i0.st,scaleTex,offsetTex);
+        freeTex(scaleTex);freeTex(offsetTex);
+        tensors[out]=r; return;
+      }
+    }
+    if(!isCpu && i0.type==='gpu' && i1.type==='gpu'){
+      tensors[out]=gpuElem(7,i0.st,i1.st.tex,0,0,0); return;
+    }
+    if(!isCpu && i0.type==='gpu' && i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:i1.value[0];
+      tensors[out]=gpuElem(4,i0.st,null,v,0,0); return;
+    }
+    // CPU fallback
+    let d0,s0,d1,s1;
+    if(i0.type==='cpu'){d0=i0.data;s0=i0.shape;}
+    else if(i0.type==='gpu'){d0=i0.st.toCpu();s0=[1,i0.st.C,i0.st.H,i0.st.W];}
+    if(i1.type==='cpu'){d1=i1.data;s1=i1.shape;}
+    else if(i1.type==='weight'){d1=this._getWeightData(i1,wt);s1=i1.shape;}
+    else if(i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:0;
+      const r=new Float32Array(d0.length);for(let j=0;j<d0.length;j++)r[j]=d0[j]+v;
+      cpuTensors[out]={data:r,shape:s0.slice()};return;
+    }
+    // Broadcast add
+    cpuTensors[out]={data:broadcastOp(d0,s0,d1,s1,(a,b)=>a+b),shape:s0.slice()};
+  }
+
+  _opUnary(out,ins,mode,tensors,cpuTensors,isCpu){
+    const i0=ins[0];
+    if(!isCpu && i0.type==='gpu'){
+      tensors[out]=gpuElem(mode,i0.st,null,0,0,0); return;
+    }
+    const d=i0.type==='cpu'?i0.data:i0.st.toCpu();
+    const s=i0.type==='cpu'?i0.shape:[i0.st.C,i0.st.H,i0.st.W];
+    const r=new Float32Array(d.length);
+    for(let j=0;j<d.length;j++){
+      const v=d[j];
+      if(mode===0) r[j]=Math.max(0,v);
+      else if(mode===1) r[j]=1/(1+Math.exp(-v));
+      else if(mode===3){
+        const x=Math.abs(v),t=1/(1+0.3275911*x);
+        r[j]=Math.sign(v)*(1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-(v*v)));
+      }
+    }
+    cpuTensors[out]={data:r,shape:s.slice()};
+  }
+
+  _opHardSig(out,ins,a,tensors,cpuTensors,isCpu){
+    const alpha=a.alpha||0.2,beta=a.beta||0.5;
+    const i0=ins[0];
+    if(!isCpu&&i0.type==='gpu'){tensors[out]=gpuElem(2,i0.st,null,0,alpha,beta);return;}
+    const d=i0.type==='cpu'?i0.data:i0.st.toCpu();
+    const s=i0.type==='cpu'?i0.shape:[i0.st.C,i0.st.H,i0.st.W];
+    const r=new Float32Array(d.length);
+    for(let j=0;j<d.length;j++) r[j]=Math.max(0,Math.min(1,d[j]*alpha+beta));
+    cpuTensors[out]={data:r,shape:s.slice()};
+  }
+
+  _opMul(out,ins,a,tensors,cpuTensors,weights,wt,isCpu){
+    const i0=ins[0],i1=ins[1];
+    if(!isCpu && i0.type==='gpu' && i1.type==='gpu'){
+      if(i1.st.H===1&&i1.st.W===1&&i0.st.H>1){
+        tensors[out]=gpuChMul(i0.st,i1.st.tex); return;
+      }
+      if(i0.st.H===1&&i0.st.W===1&&i1.st.H>1){
+        tensors[out]=gpuChMul(i1.st,i0.st.tex); return;
+      }
+      tensors[out]=gpuElem(8,i0.st,i1.st.tex,0,0,0); return;
+    }
+    if(!isCpu && i0.type==='gpu' && i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:i1.value[0];
+      tensors[out]=gpuElem(5,i0.st,null,v,0,0); return;
+    }
+    // CPU
+    let d0,s0;
+    if(i0.type==='cpu'){d0=i0.data;s0=i0.shape;}
+    else if(i0.type==='gpu'){d0=i0.st.toCpu();s0=[1,i0.st.C,i0.st.H,i0.st.W];}
+    let d1;
+    if(i1.type==='cpu'){d1=i1.data;}
+    else if(i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:i1.value[0];
+      const r=new Float32Array(d0.length);for(let j=0;j<d0.length;j++)r[j]=d0[j]*v;
+      cpuTensors[out]={data:r,shape:s0.slice()};return;
+    }
+    else if(i1.type==='weight'){d1=this._getWeightData(i1,wt);}
+    else if(i1.type==='gpu'){d1=i1.st.toCpu();}
+    const s1=i1.type==='cpu'?i1.shape:(i1.type==='weight'?i1.shape:[d1.length]);
+    cpuTensors[out]={data:broadcastOp(d0,s0,d1,s1,(a,b)=>a*b),shape:s0.slice()};
+  }
+
+  _opDiv(out,ins,tensors,cpuTensors,isCpu){
+    const i0=ins[0],i1=ins[1];
+    if(!isCpu && i0.type==='gpu' && i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:i1.value[0];
+      tensors[out]=gpuElem(6,i0.st,null,v,0,0); return;
+    }
+    let d0,s0;
+    if(i0.type==='cpu'){d0=i0.data;s0=i0.shape;}
+    else if(i0.type==='gpu'){d0=i0.st.toCpu();s0=[1,i0.st.C,i0.st.H,i0.st.W];}
+    if(i1.type==='const'){
+      const v=typeof i1.value==='number'?i1.value:1;
+      const r=new Float32Array(d0.length);for(let j=0;j<d0.length;j++)r[j]=d0[j]/v;
+      cpuTensors[out]={data:r,shape:s0.slice()};return;
+    }
+    const d1=i1.type==='cpu'?i1.data:null;
+    const s1=i1.type==='cpu'?i1.shape:[d1?d1.length:1];
+    if(d1){
+      cpuTensors[out]={data:broadcastOp(d0,s0,d1,s1,(a,b)=>a/b),shape:s0.slice()};
+    }
+  }
+
+  _opSub(out,ins,tensors,cpuTensors){
+    const d0=ins[0].data,s0=ins[0].shape;
+    const d1=ins[1].data,s1=ins[1].shape;
+    cpuTensors[out]={data:broadcastOp(d0,s0,d1,s1,(a,b)=>a-b),shape:s0.slice()};
+  }
+
+  _opPow(out,ins,cpuTensors){
+    const d0=ins[0].data,s0=ins[0].shape;
+    const exp=ins[1].type==='const'?(typeof ins[1].value==='number'?ins[1].value:ins[1].value[0]):2;
+    const r=new Float32Array(d0.length);
+    for(let j=0;j<d0.length;j++)r[j]=Math.pow(d0[j],exp);
+    cpuTensors[out]={data:r,shape:s0.slice()};
+  }
+
+  _opSqrt(out,ins,cpuTensors){
+    const d0=ins[0].data,s0=ins[0].shape;
+    const r=new Float32Array(d0.length);
+    for(let j=0;j<d0.length;j++)r[j]=Math.sqrt(d0[j]);
+    cpuTensors[out]={data:r,shape:s0.slice()};
+  }
+
+  _opReduceMean(out,ins,a,tensors,cpuTensors,isCpu){
+    const axes=a.axes||[-1];
+    const keepdims=a.keepdims!==undefined?a.keepdims:1;
+    if(!isCpu && ins[0].type==='gpu'){
+      const st=ins[0].st;
+      const axSet=new Set(axes.map(x=>x<0?x+4:x)); // 4D: [N,C,H,W], axes are 2,3 for HW
+      if(axSet.has(2)&&axSet.has(3)){
+        tensors[out]=gpuReduceMean(st); return;
+      }
+      // Fall through to CPU
+    }
+    let d,s;
+    if(ins[0].type==='gpu'){d=ins[0].st.toCpu();s=[1,ins[0].st.C,ins[0].st.H,ins[0].st.W];}
+    else{d=ins[0].data;s=ins[0].shape.slice();}
+    // Adjust axes for the tensor rank
+    const rr=cpuReduceMean(d,s,axes,keepdims);
+    cpuTensors[out]=rr;
+  }
+
+  _opPool(out,ins,a,tensors,cpuTensors,isMax){
+    const i0=ins[0];
+    let H,W;
+    if(i0.type==='gpu'){H=i0.st.H;W=i0.st.W;}
+    else{H=i0.shape[i0.shape.length-2];W=i0.shape[i0.shape.length-1];}
+    const kH=a.kernel_shape[0],kW=a.kernel_shape[1];
+    const sH=(a.strides||[1,1])[0],sW=(a.strides||[1,1])[1];
+    let pT=0,pL=0,pB=0,pR=0;
+    if(a.auto_pad==='SAME_UPPER'){
+      const totalPH=Math.max(0,(Math.ceil(H/sH)-1)*sH+kH-H);
+      const totalPW=Math.max(0,(Math.ceil(W/sW)-1)*sW+kW-W);
+      pT=Math.floor(totalPH/2);pB=totalPH-pT;
+      pL=Math.floor(totalPW/2);pR=totalPW-pL;
+    } else if(a.pads){pT=a.pads[0];pL=a.pads[1];pB=a.pads[2]||0;pR=a.pads[3]||0;}
+    const oH=Math.floor((H+pT+pB-kH)/sH)+1;
+    const oW=Math.floor((W+pL+pR-kW)/sW)+1;
+    if(i0.type==='gpu'){
+      tensors[out]=gpuPool(i0.st,kH,kW,sH,sW,pT,pL,isMax,oH,oW);
+    } else {
+      // CPU pool fallback
+      const C=i0.shape[0];
+      const d=i0.data;
+      const r=new Float32Array(C*oH*oW);
+      for(let c=0;c<C;c++)for(let oy=0;oy<oH;oy++)for(let ox=0;ox<oW;ox++){
+        let v=isMax?-Infinity:0,cnt=0;
+        for(let ky=0;ky<kH;ky++){const iy=oy*sH+ky-pT;if(iy<0||iy>=H)continue;
+        for(let kx=0;kx<kW;kx++){const ix=ox*sW+kx-pL;if(ix<0||ix>=W)continue;
+          const val=d[c*H*W+iy*W+ix];
+          if(isMax)v=Math.max(v,val);else{v+=val;cnt++;}
+        }}
+        r[c*oH*oW+oy*oW+ox]=isMax?v:(cnt>0?v/cnt:0);
+      }
+      cpuTensors[out]={data:r,shape:[C,oH,oW]};
+    }
+  }
+
+  _opResize(out,ins,a,tensors){
+    const st=ins[0].st;
+    const scales=ins[2].value; // [1,1,scaleH,scaleW]
+    const sH=Math.round(scales[2]),sW=Math.round(scales[3]);
+    tensors[out]=gpuResize(st,sH,sW);
+  }
+
+  _opConvTranspose(out,ins,a,tensors,weights,wt){
+    const st=ins[0].st;
+    const w=ins[1];
+    tensors[out]=gpuConvTranspose(st,wt.tex,wt.texW,w.offset,w.shape,a);
+  }
+
+  _opBatchNorm(out,ins,a,tensors,cpuTensors,weights,wt,isCpu){
+    const eps=a.epsilon||1e-5;
+    const gamma=this._getWeightData(ins[1],wt);
+    const beta=this._getWeightData(ins[2],wt);
+    const mean=this._getWeightData(ins[3],wt);
+    const variance=this._getWeightData(ins[4],wt);
+    const C=gamma.length;
+    const scale=new Float32Array(C),offset=new Float32Array(C);
+    for(let c=0;c<C;c++){
+      scale[c]=gamma[c]/Math.sqrt(variance[c]+eps);
+      offset[c]=beta[c]-mean[c]*scale[c];
+    }
+    if(!isCpu && ins[0].type==='gpu'){
+      const scaleTex=vecToTex(scale,C),offsetTex=vecToTex(offset,C);
+      tensors[out]=gpuAffine(ins[0].st,scaleTex,offsetTex);
+      freeTex(scaleTex);freeTex(offsetTex);return;
+    }
+    const d=ins[0].data,s=ins[0].shape;
+    const r=new Float32Array(d.length);
+    const HW=d.length/C;
+    for(let c=0;c<C;c++)for(let j=0;j<HW;j++)r[c*HW+j]=d[c*HW+j]*scale[c]+offset[c];
+    cpuTensors[out]={data:r,shape:s.slice()};
+  }
+
+  _opConcat(out,ins,rawInputs,a,tensors,cpuTensors,isCpu){
+    const axis=a.axis||0;
+    if(!isCpu){
+      const gpuIns=ins.filter(i=>i.type==='gpu').map(i=>i.st);
+      if(gpuIns.length===ins.length && axis===1){
+        tensors[out]=gpuConcat(gpuIns);return;
+      }
+    }
+    // CPU concat (for shape-building concats in rec model)
+    const parts=[];
+    for(const i of ins){
+      if(i.type==='cpu') parts.push(i.data);
+      else if(i.type==='const'){
+        const v=typeof i.value==='number'?[i.value]:(Array.isArray(i.value)?i.value:[i.value]);
+        parts.push(new Float32Array(v));
+      }
+    }
+    if(parts.length>0){
+      let total=0;for(const p of parts)total+=p.length;
+      const r=new Float32Array(total);
+      let off=0;for(const p of parts){r.set(p,off);off+=p.length;}
+      cpuTensors[out]={data:r,shape:[total]};
+    }
+  }
+
+  _opSoftmax(out,ins,a,cpuTensors){
+    const d=ins[0].data,s=ins[0].shape;
+    const axis=a.axis||-1;
+    cpuTensors[out]={data:cpuSoftmax(d,s,axis),shape:s.slice()};
+  }
+
+  _opMatMul(out,ins,tensors,cpuTensors,weights,wt){
+    let d0,s0;
+    if(ins[0].type==='cpu'){d0=ins[0].data;s0=ins[0].shape;}
+    else if(ins[0].type==='gpu'){d0=ins[0].st.toCpu();s0=[1,ins[0].st.C,ins[0].st.H,ins[0].st.W];}
+    let d1,s1;
+    if(ins[1].type==='weight'){d1=this._getWeightData(ins[1],wt);s1=ins[1].shape;}
+    else if(ins[1].type==='cpu'){d1=ins[1].data;s1=ins[1].shape;}
+    // GPU path for large 2D weight MatMul
+    if(USE_GPU_MATMUL&&ins[1].type==='weight'&&s0.length===2&&s1.length===2){
+      const M=s0[0],K=s0[1],N=s1[1];
+      if(M*N>1000){
+        const wName=ins[1].name;
+        if(!this.matWeightCache.has(wName))
+          this.matWeightCache.set(wName,matToTex(d1,K,N));
+        const bTex=this.matWeightCache.get(wName);
+        const aTex=matToTex(d0,M,K);
+        const r=gpuMatMul2D(aTex,M,K,bTex,N);
+        const outData=texToMat(r.tex,M,N);
+        freeTex(aTex);
+        recycleTex(r.tex,r.w,r.h);
+        cpuTensors[out]={data:outData,shape:[M,N]};
+        return;
+      }
+    }
+    const r=cpuMatMul(d0,s0,d1,s1);
+    cpuTensors[out]=r;
+  }
+
+  _opReshape(out,ins,tensors,cpuTensors){
+    let d,s;
+    if(ins[0].type==='gpu'){d=ins[0].st.toCpu();s=[1,ins[0].st.C,ins[0].st.H,ins[0].st.W];}
+    else if(ins[0].type==='cpu'){d=ins[0].data;s=ins[0].shape;}
+
+    let newShape;
+    if(ins[1].type==='cpu') newShape=Array.from(ins[1].data).map(x=>Math.round(x));
+    else if(ins[1].type==='const') newShape=Array.isArray(ins[1].value)?ins[1].value.slice():[ins[1].value];
+    else if(ins[1].type==='empty') newShape=[]; // scalar reshape
+
+    // Handle 0 (keep original dim) and -1 (infer)
+    const total=d.length;
+    for(let i=0;i<newShape.length;i++) if(newShape[i]===0) newShape[i]=s[i]||1;
+    const negIdx=newShape.indexOf(-1);
+    if(negIdx>=0){
+      let known=1;for(let i=0;i<newShape.length;i++)if(i!==negIdx)known*=newShape[i];
+      newShape[negIdx]=Math.round(total/known);
+    }
+    cpuTensors[out]={data:d,shape:newShape};
+  }
+
+  _opTranspose(out,ins,a,cpuTensors){
+    const d=ins[0].data,s=ins[0].shape;
+    const perm=a.perm;
+    const r=cpuTranspose(d,s,perm);
+    cpuTensors[out]=r;
+  }
+
+  _opShape(out,ins,tensors,cpuTensors){
+    let s;
+    if(ins[0].type==='gpu') s=[1,ins[0].st.C,ins[0].st.H,ins[0].st.W];
+    else if(ins[0].type==='cpu') s=ins[0].shape;
+    cpuTensors[out]={data:new Float32Array(s),shape:[s.length]};
+  }
+
+  _opSlice(out,ins,cpuTensors){
+    const d=ins[0].data, s=ins[0].shape;
+    const starts=ins[1].type==='const'?[ins[1].value]:Array.from(ins[1].data||[0]);
+    const ends=ins[2].type==='const'?[ins[2].value]:Array.from(ins[2].data||[s[0]]);
+    const axes=ins[3]?((ins[3].type==='const')?[ins[3].value]:Array.from(ins[3].data||[0])):[0];
+    const steps=ins[4]?((ins[4].type==='const')?[ins[4].value]:Array.from(ins[4].data||[1])):[1];
+
+    // Simple 1D slice for shape tensors
+    if(s.length===1){
+      const ax=0;
+      const start=Math.round(starts[0])<0?s[0]+Math.round(starts[0]):Math.round(starts[0]);
+      let end=Math.round(ends[0]);if(end<0)end=s[0]+end;if(end>s[0])end=s[0];
+      const step=Math.round(steps[0])||1;
+      const sliced=[];
+      for(let i=start;i<end;i+=step) sliced.push(d[i]);
+      cpuTensors[out]={data:new Float32Array(sliced),shape:[sliced.length]};
+      return;
+    }
+
+    // For multi-dim slice (used in attention QKV split)
+    const ax=Math.round(axes[0]);
+    const start=Math.round(starts[0]);
+    const end=Math.min(Math.round(ends[0]),s[ax]);
+    const newShape=s.slice();
+    newShape[ax]=end-start;
+    const outerSize=s.slice(0,ax).reduce((a,b)=>a*b,1);
+    const innerSize=s.slice(ax+1).reduce((a,b)=>a*b,1);
+    const r=new Float32Array(newShape.reduce((a,b)=>a*b,1));
+    for(let o=0;o<outerSize;o++){
+      for(let i=start;i<end;i++){
+        const srcOff=(o*s[ax]+i)*innerSize;
+        const dstOff=(o*(end-start)+(i-start))*innerSize;
+        for(let j=0;j<innerSize;j++) r[dstOff+j]=d[srcOff+j];
+      }
+    }
+    cpuTensors[out]={data:r,shape:newShape};
+  }
+
+  _opSqueeze(out,ins,cpuTensors){
+    const d=ins[0].data,s=ins[0].shape.slice();
+    let axes;
+    if(ins[1]&&ins[1].type==='const') axes=[typeof ins[1].value==='number'?ins[1].value:ins[1].value[0]];
+    else if(ins[1]&&ins[1].type==='cpu') axes=Array.from(ins[1].data);
+    else axes=s.map((v,i)=>v===1?i:-1).filter(x=>x>=0);
+    const axSet=new Set(axes.map(a=>a<0?a+s.length:a));
+    const newShape=s.filter((_,i)=>!axSet.has(i));
+    cpuTensors[out]={data:d,shape:newShape};
+  }
+
+  _opUnsqueeze(out,ins,cpuTensors){
+    const d=ins[0].data,s=ins[0].shape.slice();
+    let axes;
+    if(ins[1]&&ins[1].type==='const') axes=[typeof ins[1].value==='number'?ins[1].value:ins[1].value[0]];
+    else if(ins[1]&&ins[1].type==='cpu') axes=Array.from(ins[1].data);
+    else axes=[0];
+    const newShape=s.slice();
+    for(const ax of axes.sort((a,b)=>a-b)) newShape.splice(ax,0,1);
+    cpuTensors[out]={data:d,shape:newShape};
+  }
+
+  _runRecTransformerGPU(cnnOutputST, skipST, ops, weights, wt) {
+    const T=cnnOutputST.H*cnnOutputST.W;
+    const C=cnnOutputST.C, CG=Math.ceil(C/4);
+    const NH=8, HD=24, HDG=Math.ceil(HD/4);
+
+    const getWt=(name)=>{
+      if(!this.matWeightCache.has(name)){
+        const w=weights[name];
+        this.matWeightCache.set(name,matToTex(new Float32Array(wt.buf,w.offset,w.size),w.shape[0],w.shape[1]));
+      }
+      return this.matWeightCache.get(name);
+    };
+    if(!this._vecCache) this._vecCache=new Map();
+    const getVec=(name)=>{
+      if(!this._vecCache.has(name)){
+        const w=weights[name];
+        this._vecCache.set(name,matToTex(new Float32Array(wt.buf,w.offset,w.size),1,w.shape[0]));
+      }
+      return this._vecCache.get(name);
+    };
+
+    // Pass 1: find LayerNorm gamma/beta pairs
+    const lnParams=[], lnBetaSet=new Set();
+    for(let i=244;i<ops.length;i++){
+      const op=ops[i];
+      if(op.op==='Mul'&&op.inputs[1]?.type==='weight'){
+        const next=ops[i+1];
+        if(next&&next.op==='Add'&&next.inputs[1]?.type==='weight'){
+          lnParams.push({gamma:op.inputs[1].name,beta:next.inputs[1].name});
+          lnBetaSet.add(next.inputs[1].name);
+        }
+      }
+    }
+    // Pass 2: find MatMul weights, linear biases (excluding LN betas), scale values
+    const matParams=[], biasParams=[], scaleVals=[];
+    for(let i=244;i<ops.length;i++){
+      const op=ops[i];
+      if(op.op==='MatMul'){
+        const wi=op.inputs.find(inp=>inp.type==='weight');
+        if(wi) matParams.push({name:wi.name,shape:weights[wi.name].shape});
+      }
+      if(op.op==='Add'&&op.inputs[1]?.type==='weight'&&weights[op.inputs[1].name].shape.length===1
+        &&!lnBetaSet.has(op.inputs[1].name))
+        biasParams.push(op.inputs[1].name);
+      if(op.op==='Mul'&&op.inputs[1]?.type==='const'){
+        const v=typeof op.inputs[1].value==='number'?op.inputs[1].value:null;
+        if(v&&v>0.1&&v<1.0) scaleVals.push(v);
+      }
+    }
+    const layerNorm=(mt,idx)=>{
+      const ln=lnParams[idx];
+      const outTex=makeOutTex(mt.NG,mt.M);
+      gpu(P.mtLayerNorm,outTex,mt.NG,mt.M,
+        {u_inp:mt.tex,u_gamma:getVec(ln.gamma),u_beta:getVec(ln.beta)},
+        {u_N:mt.N,u_NG:mt.NG},{u_eps:1e-5});
+      return new MT(mt.M,mt.N,outTex);
+    };
+    const linear=(mt,mIdx,bIdx)=>{
+      const mp=matParams[mIdx],N=mp.shape[1];
+      let r=gpuMatMulMT(mt,getWt(mp.name),N);
+      if(bIdx<biasParams.length){
+        const outTex=makeOutTex(r.NG,r.M);
+        gpu(P.mtAddBias,outTex,r.NG,r.M,{u_inp:r.tex,u_bias:getVec(biasParams[bIdx])},null,null);
+        const old=r;r=new MT(r.M,r.N,outTex);old.free();
+      }
+      return r;
+    };
+    const elemAdd=(a,b)=>{
+      const outTex=makeOutTex(a.NG,a.M);
+      gpu(P.elem,outTex,a.NG,a.M,{u_i0:a.tex,u_i1:b.tex},{u_mode:7},{u_sc:0,u_al:0,u_be:0});
+      return new MT(a.M,a.N,outTex);
+    };
+    const scalar=(mt,mode,v)=>{
+      const outTex=makeOutTex(mt.NG,mt.M);
+      gpu(P.elem,outTex,mt.NG,mt.M,{u_i0:mt.tex},{u_mode:mode},{u_sc:v,u_al:0,u_be:0});
+      return new MT(mt.M,mt.N,outTex);
+    };
+    const sigmoid=(mt)=>scalar(mt,1,0);
+    const softmax=(mt)=>{
+      const outTex=makeOutTex(mt.NG,mt.M);
+      gpu(P.mtSoftmax,outTex,mt.NG,mt.M,{u_inp:mt.tex},{u_N:mt.N,u_NG:mt.NG},null);
+      return new MT(mt.M,mt.N,outTex);
+    };
+
+    const attention=(mt,mIdx,bIdx,scale)=>{
+      let qkv=linear(mt,mIdx,bIdx);
+      const TG=Math.ceil(T/4);
+      const split=(qi)=>{
+        const outTex=makeOutTex(HDG,NH*T);
+        gpu(P.mtQkvSplit,outTex,HDG,NH*T,{u_inp:qkv.tex},{u_T:T,u_qkvIdx:qi},null);
+        return new MT(NH*T,HD,outTex);
+      };
+      let q=split(0),k=split(1),v=split(2);
+      qkv.free();
+      if(scale){const sq=scalar(q,5,scale);q.free();q=sq;}
+      const scoresTex=makeOutTex(TG,NH*T);
+      gpu(P.mtAttnScore,scoresTex,TG,NH*T,{u_q:q.tex,u_k:k.tex},{u_T:T,u_DG:HDG},null);
+      let scores=new MT(NH*T,T,scoresTex);
+      q.free();k.free();
+      {const s=softmax(scores);scores.free();scores=s;}
+      const avTex=makeOutTex(HDG,NH*T);
+      gpu(P.mtBatchedMM,avTex,HDG,NH*T,{u_a:scores.tex,u_b:v.tex},{u_M:T,u_K:T,u_KG:TG},null);
+      let av=new MT(NH*T,HD,avTex);
+      scores.free();v.free();
+      const concTex=makeOutTex(CG,T);
+      gpu(P.mtHeadConcat,concTex,CG,T,{u_inp:av.tex},{u_T:T},null);
+      let out=new MT(T,C,concTex);
+      av.free();
+      let proj=linear(out,mIdx+1,bIdx+1);
+      out.free();
+      return proj;
+    };
+
+    const ffn=(mt,mIdx,bIdx)=>{
+      let up=linear(mt,mIdx,bIdx);
+      let sig=sigmoid(up);
+      let sw=new MT(up.M,up.N,(()=>{
+        const outTex=makeOutTex(up.NG,up.M);
+        gpu(P.elem,outTex,up.NG,up.M,{u_i0:up.tex,u_i1:sig.tex},{u_mode:8},{u_sc:0,u_al:0,u_be:0});
+        return outTex;
+      })());
+      up.free();sig.free();
+      let down=linear(sw,mIdx+1,bIdx+1);sw.free();
+      return down;
+    };
+
+    // ST -> MT
+    let x;
+    {
+      const outTex=makeOutTex(CG,T);
+      gpu(P.stToMt,outTex,CG,T,{u_inp:cnnOutputST.tex},{u_W:cnnOutputST.W,u_CG:CG},null);
+      x=new MT(T,C,outTex);
+    }
+
+    let mi=0,bi=0,li=0;
+    const scale=scaleVals[0]||(1.0/Math.sqrt(HD));
+
+    // Transformer block 1
+    {
+      let ln=layerNorm(x,li++);
+      let att=attention(ln,mi,bi,scale);mi+=2;bi+=2;ln.free();
+      let r=elemAdd(x,att);x.free();att.free();x=r;
+      ln=layerNorm(x,li++);
+      let ff=ffn(ln,mi,bi);mi+=2;bi+=2;ln.free();
+      r=elemAdd(x,ff);x.free();ff.free();x=r;
+    }
+    // Transformer block 2
+    {
+      let ln=layerNorm(x,li++);
+      let att=attention(ln,mi,bi,scale);mi+=2;bi+=2;ln.free();
+      let r=elemAdd(x,att);x.free();att.free();x=r;
+      ln=layerNorm(x,li++);
+      let ff=ffn(ln,mi,bi);mi+=2;bi+=2;ln.free();
+      r=elemAdd(x,ff);x.free();ff.free();x=r;
+    }
+    // Final LayerNorm
+    {let ln=layerNorm(x,li++);x.free();x=ln;}
+
+    // Skip connection: MT -> ST, add skipST, ST -> MT
+    {
+      const stTex=makeOutTex(T,CG);
+      gpu(P.mtToSt,stTex,T,CG,{u_inp:x.tex},null,null);
+      x.free();
+      const addTex=makeOutTex(T,CG);
+      gpu(P.elem,addTex,T,CG,{u_i0:stTex,u_i1:skipST.tex},{u_mode:7},{u_sc:0,u_al:0,u_be:0});
+      recycleTex(stTex,T,CG);
+      const mt2Tex=makeOutTex(CG,T);
+      gpu(P.stToMt,mt2Tex,CG,T,{u_inp:addTex},{u_W:T,u_CG:CG},null);
+      recycleTex(addTex,T,CG);
+      x=new MT(T,C,mt2Tex);
+    }
+
+    // Classifier MatMul
+    const mp=matParams[mi];
+    const N=mp.shape[1];
+    const clsTex=getWt(mp.name);
+    const cls=gpuMatMulMT(x,clsTex,N);
+    x.free();
+
+    // Deferred readback: return GPU texture reference
+    if(this._deferReadback){
+      return {_deferred:true,tex:cls.tex,w:cls.w,h:cls.h,M:cls.M,N:cls.N,T,biasIdx:bi,biasParams,weights,wt};
+    }
+    // Immediate readback for CPU bias + softmax + CTC decode
+    const data=texToMat(cls.tex,cls.M,cls.N);
+    recycleTex(cls.tex,cls.w,cls.h);
+    if(bi<biasParams.length){
+      const w=weights[biasParams[bi]];
+      const bd=new Float32Array(wt.buf,w.offset,w.size);
+      for(let m=0;m<T;m++)for(let n=0;n<N;n++)data[m*N+n]+=bd[n];
+    }
+    const sdata=cpuSoftmax(data,[T,N],-1);
+    return {data:sdata,shape:[T,N]};
+  }
+}
+
+function resolveDeferred(d){
+  const data=texToMat(d.tex,d.M,d.N);
+  recycleTex(d.tex,d.w,d.h);
+  if(d.biasIdx<d.biasParams.length){
+    const w=d.weights[d.biasParams[d.biasIdx]];
+    const bd=new Float32Array(d.wt.buf,w.offset,w.size);
+    for(let m=0;m<d.T;m++)for(let n=0;n<d.N;n++)data[m*d.N+n]+=bd[n];
+  }
+  return {data:cpuSoftmax(data,[d.T,d.N],-1),shape:[d.T,d.N]};
+}
+
+
+// ============ IMAGE PROCESSING ============
+function detPreprocess(imgData,imgW,imgH){
+  const ratio=DET_MAX_SIDE/Math.max(imgH,imgW);
+  const nH=Math.ceil(imgH*ratio/32)*32;
+  const nW=Math.ceil(imgW*ratio/32)*32;
+  // Resize using canvas
+  const c=document.createElement('canvas');c.width=nW;c.height=nH;
+  const ctx=c.getContext('2d');
+  const tmpC=document.createElement('canvas');tmpC.width=imgW;tmpC.height=imgH;
+  const tmpCtx=tmpC.getContext('2d');
+  tmpCtx.putImageData(new ImageData(imgData,imgW,imgH),0,0);
+  ctx.drawImage(tmpC,0,0,nW,nH);
+  const resized=ctx.getImageData(0,0,nW,nH).data;
+  // Normalize: (pixel/255 - mean) / std, CHW format
+  const blob=new Float32Array(3*nH*nW);
+  const bgr=[2,1,0]; // canvas is RGB, model expects BGR
+  for(let y=0;y<nH;y++)for(let x=0;x<nW;x++){
+    const idx=(y*nW+x)*4;
+    for(let c=0;c<3;c++){
+      blob[c*nH*nW+y*nW+x]=(resized[idx+bgr[c]]/255-DET_MEAN[c])/DET_STD[c];
+    }
+  }
+  return {data:blob,C:3,H:nH,W:nW,origH:imgH,origW:imgW};
+}
+
+function recPreprocess(lineImg,lineW,lineH){
+  const whRatio=lineW/lineH;
+  const resizedW=Math.min(Math.max(Math.floor(REC_HEIGHT*whRatio),1),3200);
+  const targetW=Math.max(resizedW,REC_TARGET_WIDTH);
+  const blob=new Float32Array(3*REC_HEIGHT*targetW);
+  const bgr=[2,1,0];
+  for(let y=0;y<REC_HEIGHT;y++){
+    const sy=(y+0.5)*lineH/REC_HEIGHT-0.5;
+    const y0=Math.floor(sy),fy=sy-y0;
+    for(let x=0;x<resizedW;x++){
+      const sx=(x+0.5)*lineW/resizedW-0.5;
+      const x0=Math.floor(sx),fx=sx-x0;
+      for(let c=0;c<3;c++){
+        const sc=bgr[c];
+        const g=(px,py)=>{
+          const px2=Math.max(0,Math.min(lineW-1,px)),py2=Math.max(0,Math.min(lineH-1,py));
+          return lineImg[(py2*lineW+px2)*4+sc];
+        };
+        const v=g(x0,y0)*(1-fx)*(1-fy)+g(x0+1,y0)*fx*(1-fy)+g(x0,y0+1)*(1-fx)*fy+g(x0+1,y0+1)*fx*fy;
+        const vq=Math.round(Math.max(0,Math.min(255,v))); // match cv2 uint8 quantization
+        blob[c*REC_HEIGHT*targetW+y*targetW+x]=(vq/255-0.5)/0.5;
+      }
+    }
+  }
+  return {data:blob,C:3,H:REC_HEIGHT,W:targetW};
+}
+
+// ============ POST-PROCESSING ============
+function cross2d(o,a,b){return(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);}
+
+function convexHull(pts){
+  const sorted=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  const n=sorted.length;if(n<=2)return sorted;
+  const hull=[];
+  for(const p of sorted){while(hull.length>=2&&cross2d(hull[hull.length-2],hull[hull.length-1],p)<=0)hull.pop();hull.push(p);}
+  const lower=hull.length+1;
+  for(let i=n-2;i>=0;i--){while(hull.length>=lower&&cross2d(hull[hull.length-2],hull[hull.length-1],sorted[i])<=0)hull.pop();hull.push(sorted[i]);}
+  hull.pop();return hull;
+}
+
+function minAreaRect(pts){
+  if(pts.length<3) return null;
+  const hull=convexHull(pts);
+  const n=hull.length;if(n<3)return null;
+  let minA=Infinity,best=null;
+  for(let i=0;i<n;i++){
+    const a=hull[i],b=hull[(i+1)%n];
+    const dx=b[0]-a[0],dy=b[1]-a[1];
+    const len=Math.sqrt(dx*dx+dy*dy);if(len<1e-6)continue;
+    const ex=dx/len,ey=dy/len;
+    let minE=Infinity,maxE=-Infinity,minP=Infinity,maxP=-Infinity;
+    for(const p of hull){
+      const pe=(p[0]-a[0])*ex+(p[1]-a[1])*ey;
+      const pp=(p[0]-a[0])*(-ey)+(p[1]-a[1])*ex;
+      if(pe<minE)minE=pe;if(pe>maxE)maxE=pe;
+      if(pp<minP)minP=pp;if(pp>maxP)maxP=pp;
+    }
+    const w=maxE-minE,h=maxP-minP,area=w*h;
+    if(area<minA){
+      minA=area;
+      const cx=a[0]+((minE+maxE)/2)*ex+((minP+maxP)/2)*(-ey);
+      const cy=a[1]+((minE+maxE)/2)*ey+((minP+maxP)/2)*ex;
+      best={center:[cx,cy],size:[w,h],angle:Math.atan2(ey,ex)*180/Math.PI};
+    }
+  }
+  return best;
+}
+
+function boxPoints(rect){
+  const rad=rect.angle*Math.PI/180;
+  const c=Math.cos(rad),s=Math.sin(rad);
+  const hw=rect.size[0]/2,hh=rect.size[1]/2;
+  return [[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]].map(([dx,dy])=>[rect.center[0]+dx*c-dy*s,rect.center[1]+dx*s+dy*c]);
+}
+
+function lineIntersect(p1,p2,p3,p4){
+  const d=(p1[0]-p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]-p4[0]);
+  if(Math.abs(d)<1e-10)return null;
+  const t=((p1[0]-p3[0])*(p3[1]-p4[1])-(p1[1]-p3[1])*(p3[0]-p4[0]))/d;
+  return[p1[0]+t*(p2[0]-p1[0]),p1[1]+t*(p2[1]-p1[1])];
+}
+
+function offsetPolygon(poly,dist){
+  const n=poly.length;
+  // Determine winding
+  let area=0;
+  for(let i=0;i<n;i++){const j=(i+1)%n;area+=(poly[j][0]-poly[i][0])*(poly[j][1]+poly[i][1]);}
+  const sign=area>0?1:-1; // CW if area>0 in screen coords
+  const offsetEdges=[];
+  for(let i=0;i<n;i++){
+    const a=poly[i],b=poly[(i+1)%n];
+    const dx=b[0]-a[0],dy=b[1]-a[1];
+    const len=Math.sqrt(dx*dx+dy*dy);if(len<1e-6)continue;
+    const nx=(-dy/len)*dist*sign,ny=(dx/len)*dist*sign;
+    offsetEdges.push([[a[0]+nx,a[1]+ny],[b[0]+nx,b[1]+ny]]);
+  }
+  const result=[];
+  for(let i=0;i<offsetEdges.length;i++){
+    const e1=offsetEdges[i],e2=offsetEdges[(i+1)%offsetEdges.length];
+    const pt=lineIntersect(e1[0],e1[1],e2[0],e2[1]);
+    result.push(pt||e1[1]);
+  }
+  return result;
+}
+
+function orderPoints(pts){
+  const s=pts.map(p=>p[0]+p[1]),d=pts.map(p=>p[0]-p[1]);
+  const o=[[0,0],[0,0],[0,0],[0,0]];
+  let minS=Infinity,maxS=-Infinity,minD=Infinity,maxD=-Infinity;
+  let iMinS,iMaxS,iMinD,iMaxD;
+  for(let i=0;i<4;i++){
+    if(s[i]<minS){minS=s[i];iMinS=i;}
+    if(s[i]>maxS){maxS=s[i];iMaxS=i;}
+    if(d[i]<minD){minD=d[i];iMinD=i;}
+    if(d[i]>maxD){maxD=d[i];iMaxD=i;}
+  }
+  return[pts[iMinS],pts[iMaxD],pts[iMaxS],pts[iMinD]];
+}
+
+function findContours(bitmap,w,h){
+  const visited=new Uint8Array(w*h);
+  const contours=[];
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    if(!bitmap[y*w+x]||visited[y*w+x])continue;
+    const queue=[[x,y]];visited[y*w+x]=1;
+    const comp=[];
+    let qi=0;
+    while(qi<queue.length){
+      const[cx,cy]=queue[qi++];comp.push([cx,cy]);
+      for(const[nx,ny]of[[cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]]){
+        if(nx>=0&&nx<w&&ny>=0&&ny<h&&bitmap[ny*w+nx]&&!visited[ny*w+nx]){
+          visited[ny*w+nx]=1;queue.push([nx,ny]);
+        }
+      }
+    }
+    if(comp.length<4)continue;
+    const border=comp.filter(([px,py])=>
+      px===0||py===0||px===w-1||py===h-1||
+      !bitmap[(py-1)*w+px]||!bitmap[(py+1)*w+px]||
+      !bitmap[py*w+px-1]||!bitmap[py*w+px+1]);
+    if(border.length>=4)contours.push({border,comp});
+  }
+  return contours;
+}
+
+function detPostprocess(probData,probH,probW,origH,origW){
+  const bitmap=new Uint8Array(probH*probW);
+  for(let i=0;i<probH*probW;i++) bitmap[i]=probData[i]>DET_THRESH?1:0;
+
+  const contours=findContours(bitmap,probW,probH);
+  const boxes=[],scores=[];
+
+  for(const{border,comp}of contours.slice(0,3000)){
+    if(border.length<4)continue;
+    let sum=0;
+    for(const[x,y]of comp) sum+=probData[y*probW+x];
+    const score=sum/comp.length;
+    if(score<DET_BOX_THRESH)continue;
+
+    const rect=minAreaRect(border);
+    if(!rect)continue;
+    const[rw,rh]=rect.size;
+    if(Math.min(rw,rh)<3)continue;
+
+    const box=boxPoints(rect);
+    const perimeter=2*(rw+rh),area=rw*rh;
+    const distance=area*DET_UNCLIP_RATIO/perimeter;
+    const expanded=offsetPolygon(box,distance);
+
+    const rect2=minAreaRect(expanded);
+    if(!rect2)continue;
+    let box2=boxPoints(rect2);
+
+    box2=box2.map(([x,y])=>[x*origW/probW,y*origH/probH]);
+    box2=orderPoints(box2);
+    boxes.push(box2.map(p=>[Math.trunc(p[0]),Math.trunc(p[1])]));
+    scores.push(score);
+  }
+  return{boxes,scores};
+}
+
+// ============ PERSPECTIVE TRANSFORM ============
+function solveLinear8(A,b){
+  const n=8,M=A.map((row,i)=>[...row,b[i]]);
+  for(let col=0;col<n;col++){
+    let maxR=col,maxV=Math.abs(M[col][col]);
+    for(let r=col+1;r<n;r++){const v=Math.abs(M[r][col]);if(v>maxV){maxV=v;maxR=r;}}
+    if(maxR!==col)[M[col],M[maxR]]=[M[maxR],M[col]];
+    const pivot=M[col][col];if(Math.abs(pivot)<1e-12)return null;
+    for(let j=col;j<=n;j++)M[col][j]/=pivot;
+    for(let r=0;r<n;r++){if(r===col)continue;const f=M[r][col];for(let j=col;j<=n;j++)M[r][j]-=f*M[col][j];}
+  }
+  return M.map(row=>row[n]);
+}
+
+function getPerspectiveTransform(src,dst){
+  const A=[],b=[];
+  for(let i=0;i<4;i++){
+    const[sx,sy]=src[i],[dx,dy]=dst[i];
+    A.push([sx,sy,1,0,0,0,-dx*sx,-dx*sy]);b.push(dx);
+    A.push([0,0,0,sx,sy,1,-dy*sx,-dy*sy]);b.push(dy);
+  }
+  const x=solveLinear8(A,b);
+  return x?[x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],1]:null;
+}
+
+function invert3x3(m){
+  const[a,b,c,d,e,f,g,h,i]=m;
+  const det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+  if(Math.abs(det)<1e-12)return null;
+  const id=1/det;
+  return[(e*i-f*h)*id,(c*h-b*i)*id,(b*f-c*e)*id,
+         (f*g-d*i)*id,(a*i-c*g)*id,(c*d-a*f)*id,
+         (d*h-e*g)*id,(b*g-a*h)*id,(a*e-b*d)*id];
+}
+
+function cropLine(imgData,imgW,imgH,box){
+  const w=Math.max(
+    Math.sqrt((box[1][0]-box[0][0])**2+(box[1][1]-box[0][1])**2),
+    Math.sqrt((box[3][0]-box[2][0])**2+(box[3][1]-box[2][1])**2)
+  );
+  const h=Math.max(
+    Math.sqrt((box[3][0]-box[0][0])**2+(box[3][1]-box[0][1])**2),
+    Math.sqrt((box[2][0]-box[1][0])**2+(box[2][1]-box[1][1])**2)
+  );
+  let dstW=Math.round(w),dstH=Math.round(h);
+  if(dstW<1||dstH<1)return null;
+
+  const result=new Float32Array(dstW*dstH*4);
+  const p0=box[0],p1=box[1],p2=box[2],p3=box[3];
+  for(let dy=0;dy<dstH;dy++){
+    const v=dy/dstH;
+    for(let dx=0;dx<dstW;dx++){
+    const u=dx/dstW;
+    const sx=(1-u)*(1-v)*p0[0]+u*(1-v)*p1[0]+u*v*p2[0]+(1-u)*v*p3[0];
+    const sy=(1-u)*(1-v)*p0[1]+u*(1-v)*p1[1]+u*v*p2[1]+(1-u)*v*p3[1];
+    const x0=Math.floor(sx),y0=Math.floor(sy);
+    const fx=sx-x0,fy=sy-y0;
+    for(let c=0;c<3;c++){
+      const g=(x2,y2)=>{
+        const xx=Math.max(0,Math.min(imgW-1,x2)),yy=Math.max(0,Math.min(imgH-1,y2));
+        return imgData[(yy*imgW+xx)*4+c];
+      };
+      result[(dy*dstW+dx)*4+c]=g(x0,y0)*(1-fx)*(1-fy)+g(x0+1,y0)*fx*(1-fy)+g(x0,y0+1)*(1-fx)*fy+g(x0+1,y0+1)*fx*fy;
+    }
+    result[(dy*dstW+dx)*4+3]=255;
+  }}
+
+  // Rotate if tall
+  if(dstH>dstW*1.5){
+    const rot=new Float32Array(dstH*dstW*4);
+    for(let y=0;y<dstH;y++)for(let x=0;x<dstW;x++){
+      const nx=y,ny=dstW-1-x;
+      for(let c=0;c<4;c++) rot[(ny*dstH+nx)*4+c]=result[(y*dstW+x)*4+c];
+    }
+    return{data:rot,w:dstH,h:dstW};
+  }
+  return{data:result,w:dstW,h:dstH};
+}
+
+// ============ CTC DECODER ============
+function ctcDecode(logits,shape,chars){
+  const T=shape[shape.length-2],C=shape[shape.length-1];
+  const result=[];let prev=0;
+  for(let t=0;t<T;t++){
+    let maxIdx=0,maxVal=-Infinity;
+    for(let c=0;c<C;c++){const v=logits[t*C+c];if(v>maxVal){maxVal=v;maxIdx=c;}}
+    if(maxIdx!==0&&maxIdx!==prev){
+      const ci=maxIdx-1;
+      if(ci>=0&&ci<chars.length)result.push(chars[ci]);
+    }
+    prev=maxIdx;
+  }
+  return result.join('');
+}
+
+function ctcConfidence(logits,shape){
+  const T=shape[shape.length-2],C=shape[shape.length-1];
+  let sum=0,cnt=0;
+  for(let t=0;t<T;t++){
+    let maxIdx=0,maxVal=-Infinity;
+    for(let c=0;c<C;c++){const v=logits[t*C+c];if(v>maxVal){maxVal=v;maxIdx=c;}}
+    if(maxIdx!==0){sum+=maxVal;cnt++;}
+  }
+  return cnt>0?sum/cnt:0;
+}
+
+// ============ OCR PIPELINE ============
+async function runOCR(exec,imgData,imgW,imgH){
+  const t0=performance.now();
+  const pre=detPreprocess(imgData,imgW,imgH);
+
+  const inputTex=cpuToSpatialTex(pre.data,pre.C,pre.H,pre.W);
+  const inputST=new ST(pre.C,pre.H,pre.W,inputTex);
+
+  const detResult=await exec.runModel('det',inputST);
+  const probData=detResult.data;
+  const probH=detResult.shape[1],probW=detResult.shape[2];
+  const tDet=performance.now()-t0;
+
+  const{boxes,scores}=detPostprocess(probData,probH,probW,pre.origH,pre.origW);
+
+  const t1=performance.now();
+  const regions=[];
+
+  // Independent strip processing with deferred readback (no cross-strip interaction)
+  exec._deferReadback=true;
+  const pending=[];
+  for(let i=0;i<boxes.length;i++){
+    const crop=cropLine(imgData,imgW,imgH,boxes[i]);
+    if(!crop)continue;
+    const rec=recPreprocess(crop.data,crop.w,crop.h);
+    const recTex=cpuToSpatialTex(rec.data,rec.C,rec.H,rec.W);
+    const recResult=await exec.runModel('rec',new ST(rec.C,rec.H,rec.W,recTex));
+    pending.push({result:recResult,box:boxes[i]});
+  }
+  exec._deferReadback=false;
+
+  for(const p of pending){
+    const resolved=p.result._deferred?resolveDeferred(p.result):p.result;
+    const text=ctcDecode(resolved.data,resolved.shape,exec.chars);
+    const conf=ctcConfidence(resolved.data,resolved.shape);
+    if(text){
+      const box=p.box,xs=box.map(q=>q[0]),ys=box.map(q=>q[1]);
+      regions.push({text,confidence:Math.round(conf*10000)/10000,bbox:{points:box,
+        x_min:Math.min(...xs),y_min:Math.min(...ys),x_max:Math.max(...xs),y_max:Math.max(...ys)}});
+    }
+  }
+  const tRec=performance.now()-t1;
+
+  regions.sort((a,b)=>a.bbox.y_min-b.bbox.y_min||a.bbox.x_min-b.bbox.x_min);
+  return{regions,timing:{detection_ms:Math.round(tDet),recognition_ms:Math.round(tRec),total_ms:Math.round(tDet+tRec)}};
+}
+
+// ============ DRAWING ============
+function drawResults(canvas,img,result){
+  const ctx=canvas.getContext('2d');
+  canvas.width=img.width;canvas.height=img.height;
+  ctx.drawImage(img,0,0);
+  for(const r of result.regions){
+    const pts=r.bbox.points;
+    const conf=r.confidence;
+    const color=`rgb(0,${Math.round(255*conf)},${Math.round(255*(1-conf))})`;
+    ctx.strokeStyle=color;ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i][0],pts[i][1]);
+    ctx.closePath();ctx.stroke();
+    const label=`${r.text} (${Math.round(conf*100)}%)`;
+    ctx.font='14px monospace';
+    const tw=ctx.measureText(label).width;
+    ctx.fillStyle=color;
+    ctx.fillRect(pts[0][0],Math.max(0,pts[0][1]-18),tw+6,18);
+    ctx.fillStyle='#fff';
+    ctx.fillText(label,pts[0][0]+3,Math.max(14,pts[0][1]-4));
+  }
+}
+
+function showResults(result){
+  const el=document.getElementById('results');
+  el.innerHTML='';
+  for(let i=0;i<result.regions.length;i++){
+    const r=result.regions[i];
+    const div=document.createElement('div');div.className='region';
+    div.textContent=`[${i+1}] ${r.text}  (${Math.round(r.confidence*100)}%)  (${r.bbox.x_min},${r.bbox.y_min})-(${r.bbox.x_max},${r.bbox.y_max})`;
+    el.appendChild(div);
+  }
+  const timing=document.createElement('div');
+  timing.style.cssText='color:#888;margin-top:8px;font-size:12px';
+  timing.textContent=`Detection: ${result.timing.detection_ms}ms | Recognition: ${result.timing.recognition_ms}ms | Total: ${result.timing.total_ms}ms`;
+  el.appendChild(timing);
+}
+
+// ============ MAIN ============
+(async function main(){
+  try{
+    setStatus('매니페스트 로딩 중...');
+    const manifestResp=await fetch('model_manifest.json');
+    if(!manifestResp.ok) throw new Error('Failed to load manifest');
+    const manifest=await manifestResp.json();
+
+    setStatus('Detection 모델 가중치 로딩 중...');
+    const detBufF16=await(await fetch('det_weights_f16.bin')).arrayBuffer();
+    const detWT=makeWeightTex(detBufF16);
+    detWT.buf=f16ToF32(new Uint16Array(detBufF16)).buffer;
+
+    setStatus('Recognition 모델 가중치 로딩 중...');
+    const recBufF16=await(await fetch('rec_weights_f16.bin')).arrayBuffer();
+    const recWT=makeWeightTex(recBufF16);
+    recWT.buf=f16ToF32(new Uint16Array(recBufF16)).buffer;
+
+    const exec=new GraphExec(manifest,detWT,recWT);
+    setStatus('준비 완료. 이미지를 선택하세요.');
+    document.getElementById('fileInput').disabled=false;
+
+    document.getElementById('fileInput').addEventListener('change',async e=>{
+      const file=e.target.files[0];if(!file)return;
+      setStatus('이미지 로딩 중...');
+      const img=new Image();
+      img.onload=async()=>{
+        const canvas=document.getElementById('canvas');
+        const ctx=canvas.getContext('2d');
+        canvas.width=img.width;canvas.height=img.height;
+        ctx.drawImage(img,0,0);
+        const imgData=ctx.getImageData(0,0,img.width,img.height);
+
+        setStatus('OCR 처리 중...');
+        logEl.textContent='';
+        await new Promise(r=>setTimeout(r,50));
+
+        try{
+          const result=await runOCR(exec,imgData.data,img.width,img.height);
+          drawResults(canvas,img,result);
+          showResults(result);
+          setStatus(`완료: ${result.regions.length}개 텍스트 영역 (${result.timing.total_ms}ms)`);
+        }catch(err){
+          console.error(err);
+          setStatus('오류: '+err.message);
+          log('ERROR: '+err.stack);
+        }
+      };
+      img.src=URL.createObjectURL(file);
+    });
+  }catch(err){
+    console.error(err);
+    setStatus('초기화 오류: '+err.message);
+    log('ERROR: '+err.stack);
+  }
+})();
+</script>
+</body>
+</html>
