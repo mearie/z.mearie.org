@@ -1,0 +1,297 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Synthetic Seashore</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a1628;
+  color: #c8d8e8;
+  font-family: system-ui, sans-serif;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+}
+.container { text-align: center; padding: 2rem; }
+h1 { font-size: 1.4rem; font-weight: 300; letter-spacing: 0.1em; margin-bottom: 0.5rem; color: #7aa8c8; }
+.credit { font-size: 0.8rem; color: #5888a8; margin-bottom: 1.5rem; }
+.credit a { color: #6898b8; }
+button {
+  background: #1a3050; color: #a0c8e8; border: 1px solid #2a4868;
+  padding: 0.8rem 2rem; font-size: 1rem; border-radius: 4px; cursor: pointer;
+  transition: background 0.2s;
+}
+button:hover { background: #2a4868; }
+button:disabled { opacity: 0.4; cursor: default; }
+#status { margin-top: 1rem; font-size: 0.85rem; color: #5888a8; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>SYNTHETIC SEASHORE</h1>
+  <p class="credit">Based on <a href="https://www.ioccc.org/2025/tompng/index.html">IOCCC 2025 winner (2025/tompng)</a></p>
+  <button id="btn" onclick="toggle()">Play</button>
+  <div id="status"></div>
+</div>
+
+<script>
+"use strict";
+
+const H = 44100, P = 13;
+
+class RNG {
+  constructor(seed) { this.s = (seed >>> 0) || 1; }
+  next() { this.s = (this.s * 1103515245 + 12345) & 0x7fffffff; return this.s; }
+  R() { return this.next() / 0x7fffffff; }
+}
+
+function F(s, e, x, y, v) {
+  const f0 = e, f1 = e * e, f2 = f1 * e;
+  let t;
+  t = s[0]; s[0] = (s[0] * x - s[1] * y) * f0 + v; s[1] = (t * y + s[1] * x) * f0;
+  t = s[2]; s[2] = (s[2] * x - s[3] * y) * f1 + v; s[3] = (t * y + s[3] * x) * f1;
+  t = s[4]; s[4] = (s[4] * x - s[5] * y) * f2 + v; s[5] = (t * y + s[5] * x) * f2;
+  return Math.sqrt(1 - e) * 20 * (s[0] - 2 * s[2] + s[4]);
+}
+
+function doG(a, srcBufsIn, srcLensIn, J, W, rng) {
+  const layers = 15 - 5 * a;
+  let srcBufs = srcBufsIn.slice();
+  let srcLens = new Int32Array(srcLensIn);
+
+  for (let i = 0; i < layers; i++) {
+    const l = i * P;
+    const nextBufs = new Array(P);
+    const nextLens = new Int32Array(P);
+
+    for (let k = P - 1; k >= 0; k--) {
+      const h = rng.next() % P;
+      let d, e, f, c;
+      if (a) { d = rng.R() * H / 2; e = 1; f = 1 + rng.R() / 5; c = 0.3; }
+      else { d = (0.2 + rng.R()) * H / 3 * Math.pow(1.1, i); e = 1.2 + rng.R() / 10; f = 1.3 + rng.R() / 5; c = 0.5; }
+      if (rng.next() % 2) { const tmp = e; e = f; f = tmp; }
+      const g = c + rng.R(); c += rng.R();
+      const jLen = Math.floor(Math.max(srcLens[k] / e, srcLens[h] / f + d)) + 1;
+      W[l + k] = jLen;
+      const o = new Float64Array(jLen);
+      J[l + k] = o;
+      for (let j = jLen - 1; j >= 0; j--) {
+        const m = Math.floor(j * e);
+        const nn = Math.floor(Math.max(j - d, 0) * f);
+        o[j] = g * (m < srcLens[k] ? srcBufs[k][m] : 0) + c * (nn < srcLens[h] ? srcBufs[h][nn] : 0);
+      }
+      nextBufs[k] = o; nextLens[k] = jLen;
+    }
+    srcBufs = nextBufs; srcLens = nextLens;
+  }
+}
+
+function buildBuffers() {
+  const rng = new RNG((Date.now() & 0x7fffffff) || 1);
+  const I = new Array(P), V = new Int32Array(P);
+
+  for (let k = P - 1; k >= 0; k--) {
+    const s = new Float64Array(6), len = 28098;
+    V[k] = len; I[k] = new Float64Array(len);
+    for (let i = 0; i < len; i++)
+      I[k][i] = F(s, 0.998, 0.9995, 0.0316, rng.R() - 0.5) * Math.pow(0.1, i * 8.0 / H) - 8e-6;
+  }
+
+  const J = new Array(P * 15), W = new Int32Array(P * 15);
+  doG(0, I, V, J, W, rng);
+
+  const newV = new Int32Array(P);
+  for (let k = P - 1; k >= 0; k--) {
+    I[k] = new Float64Array(300000); newV[k] = 0;
+    for (let i = 14; i >= 0; i--) {
+      const a = i * P + (k + i) % P, b = rng.next() % 3000;
+      for (let j = W[a] - 1; j >= 0; j--) {
+        I[k][j + b] += J[a][j] * Math.pow(0.63, i);
+        if (j + b + 1 > newV[k]) newV[k] = j + b + 1;
+      }
+    }
+  }
+  for (let k = 0; k < P; k++) V[k] = newV[k];
+
+  doG(1, I, V, J, W, rng);
+  return { J, W, rng };
+}
+
+// --- ScriptProcessorNode approach (more compatible) ---
+
+let ctx, scriptNode, playing = false, bufs = null;
+
+// Playback state
+let stU, stN, stQ, stS, stT, stM, stK, stO, stNoteSeq;
+let stSampleIndex, stCl, stCm, stCt, stCu, stCo, playRng;
+const chords = [750912, 619552, 553760, 685360];
+
+function initPlaybackState(rng) {
+  playRng = rng;
+  stU = new Int32Array(6);
+  stN = new Float64Array(3);
+  stQ = 0; stS = 0; stT = 0;
+  stM = new Float64Array(6);
+  stK = []; for (let i = 0; i < 18; i++) stK.push(new Float64Array(6));
+  stO = new Float64Array(10);
+  stNoteSeq = new Int32Array(256);
+  stSampleIndex = 0;
+  stCl = 0; stCm = 8; stCt = 2; stCu = 2; stCo = 0;
+}
+
+function generateSamples(outL, outR, len) {
+  const { J, W } = bufs;
+
+  for (let s = 0; s < len; s++) {
+    const i = stSampleIndex++;
+    let f0 = 0, f1 = 0, f2 = 0, f3 = 0, f4 = 0, f5 = 0, f6 = 0;
+
+    // 3 wave playback channels
+    for (let k = 2; k >= 0; k--) {
+      let j = stU[k + 3];
+      if (!j || stU[k] > W[j]) {
+        j = stU[k + 3] = 4 * P + playRng.next() % (6 * P);
+        stN[k] = 1 + playRng.R() / 3;
+        stU[k] = 0;
+      }
+      const a = Math.floor(stU[k] * stN[k]);
+      const val = (a < W[j] && J[j]) ? J[j][a] : 0;
+      if (k === 0) f0 = val; else if (k === 1) f1 = val; else f2 = val;
+      stU[k]++;
+    }
+
+    // Low-frequency modulators
+    stQ = stQ * 0.96 + playRng.R() - 0.5;
+    const xn = playRng.R() - 0.5;
+    stS = stS * 0.99 + xn;
+    stT = stT * 0.8 + xn;
+
+    // Broadband noise
+    const e = F(stM, 0.7, 0.71, 0.71, playRng.R() - 0.5) * 0.6 + 11 * (stM[1] - 2 * stM[3] + stM[5]);
+
+    // Slow random walks
+    for (let k = 3; k >= 0; k--) {
+      const val = F(stK[k], 1 - 1e-5, 1, 0, playRng.R() - 0.5);
+      if (k === 0) f3 = val; else if (k === 1) f4 = val; else if (k === 2) f5 = val; else f6 = val;
+    }
+
+    // Musical parameters every 60s
+    const period = H * 60;
+    if (i % period < 1) {
+      stCl = playRng.next() % 4;
+      stCm = 8 + playRng.next() % 4;
+      if (stCm > 10) stCm++;
+      stCt = 2 + playRng.next() % 10;
+      stCu = 2 + playRng.next() % 10;
+      stCo = 0;
+    }
+
+    // Note triggering
+    let g = 0;
+    let c = (i - H * 10) % period;
+    if (c < 0) c += period;
+    const beatLen = (H / 4) | 0;
+    const j = (c / beatLen) | 0;
+
+    if (c >= 0 && (c % beatLen === 0) && c <= H * 40) {
+      let x = Math.min(1, (H * 45 - c) * 0.1 / H);
+      let aa = stCo < stCm ? -1 : stNoteSeq[(stCo - stCm) & 255];
+      const d = stCm * 8;
+      const b = (j % d < stCm) ? 1 : 0;
+      aa = b ? (stCo < d ? -1 : stNoteSeq[(stCo - d) & 255]) : aa;
+      aa = (aa < 0 || (j % (stCm * 4) < stCm && !b ? playRng.R() < 0.5 : playRng.R() < 0.2))
+        ? playRng.next() % 5 : aa;
+      aa = playRng.R() < 0.1 ? aa % 5 + 5 : aa;
+      stNoteSeq[stCo & 255] = aa;
+      stCo++;
+      const bEnd = (H * 40 - c) < 8.0 * H * playRng.R();
+      const dd = j % stCm;
+      let cc = (dd * stCt) % P;
+      if (cc < 3 + ((((j / stCm / 2) | 0) ^ stCu) % 4) ||
+          ((((j + stCu) / stCm) | 0) % 2 && cc > 11)) {
+        if (bEnd) {
+          stO[0] += x * playRng.R();
+        } else {
+          stO[aa] += x * playRng.R();
+          cc = dd % 3;
+          if (cc) {
+            cc = (stCo - 1) - 7 - 6 * cc;
+            if (cc >= 0) stO[stNoteSeq[cc & 255]] += x * playRng.R();
+          }
+        }
+        stO[0] += 0.4 * x * (dd === 0 ? 1 : 0);
+      }
+    }
+
+    // Synthesize notes
+    for (let k = 9; k >= 0; k--) {
+      stO[k] *= (1 - 4e-5);
+      const semitone = (chords[stCl] >> ((k % 5) * 4)) % 16;
+      const freq = Math.pow(2, ((k / 5) | 0) + semitone / 12.0) / 48;
+      g += Math.sin(freq * i) * F(stK[k + 8], 0.99, 1, 0, stO[k]);
+    }
+
+    // Stereo output
+    for (let k = 1; k >= 0; k--) {
+      const ch = 2 * k - 1;
+      let x = f0 + (f1 + f2) / 2 + (f1 - f2) * ch / 5;
+      const y = F(stK[k + 4], 1 - 1e-4, 1, 0, Math.abs(x));
+      x += y * stT / 1e4
+         + F(stK[k + 6], 1 - 5e-5, 1, 0, y) * e / 1e7
+         + (stQ * Math.pow(1.5, f3 + ch * f5 / 9) + stS * Math.pow(1.5, f4 + ch * f6 / 9)) / 32;
+      x = x / 9 + g / 400;
+      const z = Math.min(i / 1e5, 1);
+      const val = z * z * (3 - 2 * z) * x / Math.sqrt(1 + x * x);
+      if (k === 1) outR[s] = val; else outL[s] = val;
+    }
+  }
+}
+
+function statusMsg(msg) { document.getElementById('status').textContent = msg; }
+
+async function toggle() {
+  const btn = document.getElementById('btn');
+  if (playing) {
+    ctx.suspend();
+    playing = false;
+    btn.textContent = 'Play';
+    statusMsg('Paused');
+    return;
+  }
+  if (!ctx) {
+    btn.disabled = true;
+    statusMsg('Building wave buffers...');
+
+    // Yield to UI before heavy computation
+    await new Promise(r => setTimeout(r, 50));
+
+    bufs = buildBuffers();
+    initPlaybackState(bufs.rng);
+
+    ctx = new AudioContext({ sampleRate: H });
+    // Use 4096-sample buffer for efficiency
+    scriptNode = ctx.createScriptProcessor(4096, 0, 2);
+    scriptNode.onaudioprocess = function(ev) {
+      const outL = ev.outputBuffer.getChannelData(0);
+      const outR = ev.outputBuffer.getChannelData(1);
+      generateSamples(outL, outR, outL.length);
+    };
+    scriptNode.connect(ctx.destination);
+
+    btn.disabled = false;
+    statusMsg('Playing');
+    playing = true;
+    btn.textContent = 'Pause';
+    return;
+  }
+  ctx.resume();
+  playing = true;
+  btn.textContent = 'Pause';
+  statusMsg('Playing');
+}
+</script>
+</body>
+</html>
